@@ -16,13 +16,13 @@ import (
 )
 
 type remoteMailboxDeleteClientFixture struct {
-	remote       protocol.ICloudRemoteMailbox
-	operations   []string
-	remoteIDs    []string
-	listCalls    int
-	moveErr      error
-	cleanedEmail string
-	onDelete     func()
+	remote        protocol.ICloudRemoteMailbox
+	operations    []string
+	remoteIDs     []string
+	listCalls     int
+	moveErr       error
+	emptyTrashErr error
+	onDelete      func()
 }
 
 func (f *remoteMailboxDeleteClientFixture) ListPrivacyMailboxes(context.Context, protocol.ICloudSession) ([]protocol.ICloudRemoteMailbox, error) {
@@ -45,30 +45,27 @@ func (f *remoteMailboxDeleteClientFixture) DeletePrivacyMailbox(_ context.Contex
 	return nil
 }
 
-func (f *remoteMailboxDeleteClientFixture) CleanRemoteMailForAddress(_ context.Context, _ protocol.ICloudSession, email string) (protocol.ICloudAddressMailCleanupResult, error) {
-	f.operations = append(f.operations, "扫描并清理目标邮箱邮件")
-	f.cleanedEmail = email
-	if f.moveErr != nil {
-		return protocol.ICloudAddressMailCleanupResult{}, f.moveErr
-	}
-	return protocol.ICloudAddressMailCleanupResult{Matched: len(f.remoteIDs), MovedToTrash: len(f.remoteIDs), Destroyed: len(f.remoteIDs)}, nil
-}
-
 func (f *remoteMailboxDeleteClientFixture) MoveRemoteMessagesToTrash(_ context.Context, _ protocol.ICloudSession, remoteIDs []string) (protocol.ICloudMailCleanupResult, error) {
 	f.operations = append(f.operations, "移动远端邮件")
 	f.remoteIDs = append([]string(nil), remoteIDs...)
 	if f.moveErr != nil {
 		return protocol.ICloudMailCleanupResult{}, f.moveErr
 	}
-	return protocol.ICloudMailCleanupResult{MovedToTrash: len(remoteIDs)}, nil
+	return protocol.ICloudMailCleanupResult{
+		MovedToTrash:   len(remoteIDs),
+		MovedRemoteIDs: append([]string(nil), remoteIDs...),
+	}, nil
 }
 
 func (f *remoteMailboxDeleteClientFixture) EmptyTrash(context.Context, protocol.ICloudSession) (int, error) {
 	f.operations = append(f.operations, "清空远端废纸篓")
+	if f.emptyTrashErr != nil {
+		return 0, f.emptyTrashErr
+	}
 	return 1, nil
 }
 
-func TestDeleteRemoteCleansMessagesBeforeDeletingMailbox(t *testing.T) {
+func TestDeleteCompletelyUsesSyncedMessageCleanupBeforeDeletingMailbox(t *testing.T) {
 	state, mailbox := newDeleteServiceFixture(t)
 	client := &remoteMailboxDeleteClientFixture{
 		remote: protocol.ICloudRemoteMailbox{AnonymousID: mailbox.AnonymousID, Email: mailbox.Email},
@@ -84,22 +81,22 @@ func TestDeleteRemoteCleansMessagesBeforeDeletingMailbox(t *testing.T) {
 	service := NewService(config.Config{}, state)
 	service.deleteClient = client
 
-	if err := service.DeleteRemote(context.Background(), mailbox.ID); err != nil {
+	if err := service.DeleteCompletely(context.Background(), mailbox.ID); err != nil {
 		t.Fatalf("彻底删除邮箱失败：%v", err)
 	}
-	expected := []string{"扫描并清理目标邮箱邮件", "查询远端邮箱", "删除远端邮箱", "查询远端邮箱"}
+	expected := []string{"移动远端邮件", "清空远端废纸篓", "查询远端邮箱", "删除远端邮箱", "查询远端邮箱"}
 	if !reflect.DeepEqual(client.operations, expected) {
 		t.Fatalf("删除执行顺序不正确：得到 %v，期望 %v", client.operations, expected)
 	}
-	if client.cleanedEmail != mailbox.Email {
-		t.Fatalf("扫描的隐私邮箱不正确：%s", client.cleanedEmail)
+	if !reflect.DeepEqual(client.remoteIDs, []string{"icloud:Inbox:101"}) {
+		t.Fatalf("远端邮件标识不正确：%v", client.remoteIDs)
 	}
 	if _, ok := state.FindMailboxByID(mailbox.ID); ok {
 		t.Fatal("完成邮件清理和 Apple 删除后，本地邮箱记录仍然存在")
 	}
 }
 
-func TestDeleteRemoteStopsWhenRemoteMessageCleanupFails(t *testing.T) {
+func TestDeleteCompletelyStopsWhenMovingRemoteMessagesFails(t *testing.T) {
 	state, mailbox := newDeleteServiceFixture(t)
 	client := &remoteMailboxDeleteClientFixture{
 		remote:  protocol.ICloudRemoteMailbox{AnonymousID: mailbox.AnonymousID, Email: mailbox.Email},
@@ -108,11 +105,11 @@ func TestDeleteRemoteStopsWhenRemoteMessageCleanupFails(t *testing.T) {
 	service := NewService(config.Config{}, state)
 	service.deleteClient = client
 
-	err := service.DeleteRemote(context.Background(), mailbox.ID)
-	if err == nil || !strings.Contains(err.Error(), "删除邮箱前清理 Apple 远端邮件失败") {
+	err := service.DeleteCompletely(context.Background(), mailbox.ID)
+	if err == nil || !strings.Contains(err.Error(), "删除隐私邮箱前清理已同步的 Apple 远端邮件失败") {
 		t.Fatalf("未返回明确的邮件清理错误：%v", err)
 	}
-	if !reflect.DeepEqual(client.operations, []string{"扫描并清理目标邮箱邮件"}) {
+	if !reflect.DeepEqual(client.operations, []string{"移动远端邮件"}) {
 		t.Fatalf("清理失败后仍执行了后续步骤：%v", client.operations)
 	}
 	if _, ok := state.FindMailboxByID(mailbox.ID); !ok {
@@ -120,6 +117,57 @@ func TestDeleteRemoteStopsWhenRemoteMessageCleanupFails(t *testing.T) {
 	}
 	if messages := state.MessagesForMailbox(mailbox.ID); len(messages) != 2 {
 		t.Fatalf("远端邮件清理失败时不应清空本地邮件：剩余 %d 封", len(messages))
+	}
+}
+
+func TestDeleteCompletelyKeepsLocalDataWhenEmptyTrashFails(t *testing.T) {
+	state, mailbox := newDeleteServiceFixture(t)
+	client := &remoteMailboxDeleteClientFixture{
+		remote:        protocol.ICloudRemoteMailbox{AnonymousID: mailbox.AnonymousID, Email: mailbox.Email},
+		emptyTrashErr: errors.New("清空废纸篓测试失败"),
+	}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	err := service.DeleteCompletely(context.Background(), mailbox.ID)
+	if err == nil || !strings.Contains(err.Error(), "清空废纸篓测试失败") {
+		t.Fatalf("未返回清空废纸篓错误：%v", err)
+	}
+	if !reflect.DeepEqual(client.operations, []string{"移动远端邮件", "清空远端废纸篓"}) {
+		t.Fatalf("清空废纸篓失败后仍执行了后续步骤：%v", client.operations)
+	}
+	if _, ok := state.FindMailboxByID(mailbox.ID); !ok {
+		t.Fatal("清空废纸篓失败时本地邮箱记录应保留")
+	}
+	if messages := state.MessagesForMailbox(mailbox.ID); len(messages) != 2 {
+		t.Fatalf("清空废纸篓失败时本地邮件应保留：剩余 %d 封", len(messages))
+	}
+}
+
+func TestCleanRemoteMessagesUsesSharedSyncedMessageCleanup(t *testing.T) {
+	state, mailbox := newDeleteServiceFixture(t)
+	client := &remoteMailboxDeleteClientFixture{}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	result, err := service.CleanRemoteMessages(context.Background(), mailbox.ID, RemoteCleanupOptions{
+		MoveSynced: true,
+		EmptyTrash: true,
+	})
+	if err != nil {
+		t.Fatalf("清理 Apple 远端邮件失败：%v", err)
+	}
+	if !reflect.DeepEqual(client.operations, []string{"移动远端邮件", "清空远端废纸篓"}) {
+		t.Fatalf("详情清理执行顺序不正确：%v", client.operations)
+	}
+	if result.MovedToTrash != 1 || result.Destroyed != 1 || result.LocalRemoved != 1 {
+		t.Fatalf("详情清理结果不正确：%+v", result)
+	}
+	if _, ok := state.FindMailboxByID(mailbox.ID); !ok {
+		t.Fatal("详情清理后隐私邮箱记录应保留")
+	}
+	if messages := state.MessagesForMailbox(mailbox.ID); len(messages) != 1 || messages[0].RemoteID != "" {
+		t.Fatalf("详情清理后应仅保留缺少远端标识的本地邮件：%+v", messages)
 	}
 }
 

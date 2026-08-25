@@ -568,6 +568,52 @@ textarea.field {
   width: min(520px, 100%);
 }
 
+.mailbox-bulk-delete-dialog {
+  width: min(560px, 100%);
+}
+
+.mailbox-bulk-delete-fields {
+  display: grid;
+  gap: 10px;
+  padding: 21px 22px 0;
+}
+
+.mailbox-operation-dialog .mailbox-bulk-delete-input {
+  width: 100%;
+  height: 220px;
+  min-height: 140px;
+  padding: 10px 12px;
+  resize: none;
+  font-family: inherit;
+  line-height: 1.6;
+}
+
+.mailbox-bulk-delete-error {
+  padding: 9px 11px;
+  border: 1px solid #fecdd3;
+  border-radius: 9px;
+  color: #be123c;
+  background: #fff1f2;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.dark .mailbox-bulk-delete-error {
+  border-color: #4c0519;
+  color: #fda4af;
+  background: rgb(76 5 25 / 38%);
+}
+
+.mailbox-dialog-actions .mailbox-bulk-delete-submit {
+  color: #fff;
+  background: #e11d48;
+  box-shadow: 0 7px 18px rgb(225 29 72 / 18%);
+}
+
+.mailbox-dialog-actions .mailbox-bulk-delete-submit:hover:not(:disabled) {
+  background: #be123c;
+}
+
 .mailbox-dialog-heading {
   display: flex;
   align-items: flex-start;

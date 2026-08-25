@@ -32,12 +32,15 @@ const selectedMailboxes = ref([])
 const accounts = ref([])
 const showImport = ref(false)
 const showSync = ref(false)
+const showBulkDelete = ref(false)
+const bulkDeleteEmails = ref('')
+const bulkDeleteError = ref('')
 const quickEditOpen = ref(false)
 const quickEditField = ref('note')
 const quickEditMailbox = ref(null)
 const deleteConfirmID = ref('')
 const deleteQueue = ref([])
-const deletingMailboxID = ref('')
+const deletingMailboxIDs = ref([])
 const edit = reactive({ status: 'available', api_active: true, icloud_active: true, note: '' })
 const quickEdit = reactive({ status: 'available', note: '' })
 const remoteClean = reactive({ move_synced: true, empty_trash: true })
@@ -61,6 +64,8 @@ let mailboxLayoutObserver
 let loadRequestID = 0
 let messageLoadRequestID = 0
 let deleteQueueRunning = false
+const maxConcurrentDeleteAccounts = 4
+const activeDeleteAccounts = new Set()
 let autoRefreshing = false
 let deleteNoticeID = null
 let deleteSucceeded = 0
@@ -101,6 +106,7 @@ const syncAccountOptions = computed(() => [{ value: '', label: '全部 Apple 账
 const hasRowBusyActions = computed(() => Object.keys(rowBusyActions.value).length > 0)
 const codeDialogBusy = computed(() => isBusy('code') || Boolean(codeMailbox.value?.id && rowBusyAction(codeMailbox.value.id) === 'code'))
 const quickEditTitle = computed(() => quickEditField.value === 'note' ? '修改备注' : '修改邮箱状态')
+const bulkDeleteEmailCount = computed(() => parseBulkDeleteEmails(bulkDeleteEmails.value).length)
 const selectedMailboxIDs = computed(() => selectedMailboxes.value.map((mailbox) => mailbox.id))
 const selectedDeletableCount = computed(() => selectedMailboxes.value.filter((mailbox) => !isMailboxDeleteBusy(mailbox.id)).length)
 const selectedPageCount = computed(() => (result.value.items || []).filter((mailbox) => selectedMailboxIDs.value.includes(mailbox.id)).length)
@@ -457,13 +463,85 @@ function openSyncDialog() {
   }
   syncAccountID.value = ''
   showImport.value = false
+  showBulkDelete.value = false
   showSync.value = true
 }
 
 function openImportDialog() {
   showSync.value = false
+  showBulkDelete.value = false
   if (!mailboxImport.account_id && accounts.value.length) mailboxImport.account_id = accounts.value[0].id
   showImport.value = true
+}
+
+function parseBulkDeleteEmails(value) {
+  const seen = new Set()
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((email) => email.trim().toLowerCase())
+    .filter((email) => {
+      if (!email || seen.has(email)) return false
+      seen.add(email)
+      return true
+    })
+}
+
+function emailListSummary(emails) {
+  const items = emails || []
+  if (items.length <= 5) return items.join('、')
+  return `${items.slice(0, 5).join('、')} 等 ${items.length} 个邮箱`
+}
+
+function openBulkDeleteDialog() {
+  showImport.value = false
+  showSync.value = false
+  bulkDeleteEmails.value = ''
+  bulkDeleteError.value = ''
+  showBulkDelete.value = true
+}
+
+function closeBulkDeleteDialog() {
+  if (isBusy('bulk-delete-resolve')) return
+  showBulkDelete.value = false
+  bulkDeleteError.value = ''
+}
+
+async function submitBulkDeleteEmails() {
+  const emails = parseBulkDeleteEmails(bulkDeleteEmails.value)
+  if (!emails.length) {
+    bulkDeleteError.value = '请至少输入一个邮箱地址。'
+    return
+  }
+  const invalid = emails.filter((email) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+  if (invalid.length) {
+    bulkDeleteError.value = `邮箱格式不正确：${emailListSummary(invalid)}`
+    return
+  }
+  if (!startBusy('bulk-delete-resolve')) return
+  bulkDeleteError.value = ''
+  try {
+    const data = await api('/api/mailboxes/resolve', {
+      method: 'POST',
+      body: JSON.stringify({ emails }),
+    })
+    const resolved = data.items || []
+    const targets = resolved.filter((mailbox) => !isMailboxDeleteBusy(mailbox.id))
+    const missing = data.missing || []
+    if (!targets.length) {
+      if (missing.length) bulkDeleteError.value = `本地邮箱池中未找到：${emailListSummary(missing)}`
+      else bulkDeleteError.value = '这些邮箱已经在删除队列中。'
+      return
+    }
+    enqueueMailboxDeletions(targets)
+    showBulkDelete.value = false
+    bulkDeleteEmails.value = ''
+    flash(`已将 ${targets.length} 个指定邮箱加入彻底删除队列`)
+    if (missing.length) showError(`未在本地邮箱池找到：${emailListSummary(missing)}`)
+  } catch (err) {
+    bulkDeleteError.value = err.message
+  } finally {
+    finishBusy('bulk-delete-resolve')
+  }
 }
 
 function calculateMailboxTableSize() {
@@ -977,7 +1055,7 @@ async function removeSelectedMailboxes() {
   try {
     const confirmed = await confirmAction({
       title: `彻底删除选中的 ${targets.length} 个邮箱`,
-      message: '将逐个扫描选中邮箱所属 Apple 账号的全部真实邮件文件夹，只清理收件人匹配选中隐私邮箱的云端邮件，然后删除 Apple 隐私邮箱和本地记录。其他邮箱的邮件和废纸篓不受影响。',
+      message: '将根据本地已同步邮件保存的远端标识，逐个把对应 Apple 邮件移入废纸篓并清空所属账号的整个废纸篓，然后删除 Apple 隐私邮箱和本地记录。未同步到本地的历史邮件不会参与定位。',
       confirmText: '确认彻底删除',
       tone: 'danger',
     })
@@ -989,31 +1067,44 @@ async function removeSelectedMailboxes() {
 }
 
 function enqueueMailboxDeletions(mailboxes) {
-  const targets = (mailboxes || []).filter((mailbox) => mailbox?.id && deletingMailboxID.value !== mailbox.id && !isMailboxDeleteQueued(mailbox.id))
+  const targets = (mailboxes || []).filter((mailbox) => mailbox?.id && !isMailboxDeleting(mailbox.id) && !isMailboxDeleteQueued(mailbox.id))
   if (!targets.length) return
   if (!deleteQueueRunning) {
     deleteSucceeded = 0
     deleteFailed = 0
     deleteLastError = ''
   }
-  deleteQueue.value.push(...targets.map((mailbox) => ({ id: mailbox.id, email: mailbox.email, localOnly: Boolean(mailbox.localOnly) })))
+  deleteQueue.value.push(...targets.map((mailbox) => ({
+    id: mailbox.id,
+    email: mailbox.email,
+    accountID: mailbox.account_id || mailbox.accountID || '',
+    localOnly: Boolean(mailbox.localOnly),
+  })))
   updateDeleteProgress()
-  void processDeleteQueue()
+  processDeleteQueue()
 }
 
 function isMailboxDeleteQueued(mailboxID) {
   return deleteQueue.value.some((item) => item.id === mailboxID)
 }
 
+function isMailboxDeleting(mailboxID) {
+  return deletingMailboxIDs.value.includes(mailboxID)
+}
+
 function isMailboxDeleteBusy(mailboxID) {
-  return deleteConfirmID.value === mailboxID || deletingMailboxID.value === mailboxID || isMailboxDeleteQueued(mailboxID)
+  return deleteConfirmID.value === mailboxID || isMailboxDeleting(mailboxID) || isMailboxDeleteQueued(mailboxID)
+}
+
+function mailboxDeleteAccountKey(mailbox) {
+  return mailbox.accountID || 'unknown-account'
 }
 
 function updateDeleteProgress() {
   const finished = deleteSucceeded + deleteFailed
-  const running = deletingMailboxID.value ? 1 : 0
-  const waiting = Math.max(0, deleteQueue.value.length - running)
-  const total = finished + deleteQueue.value.length
+  const running = deletingMailboxIDs.value.length
+  const waiting = deleteQueue.value.length
+  const total = finished + running + waiting
   if (!total) return
   deleteNoticeID = updateToast(
     deleteNoticeID,
@@ -1032,36 +1123,41 @@ function finishDeleteProgress() {
   deleteNoticeID = updateToast(deleteNoticeID, text, type, 7000)
 }
 
-async function processDeleteQueue() {
-  if (deleteQueueRunning) return
-  deleteQueueRunning = true
+function processDeleteQueue() {
+  if (!deleteQueueRunning) deleteQueueRunning = true
+  while (activeDeleteAccounts.size < maxConcurrentDeleteAccounts) {
+    const queueIndex = deleteQueue.value.findIndex((mailbox) => !activeDeleteAccounts.has(mailboxDeleteAccountKey(mailbox)))
+    if (queueIndex < 0) break
+    const [mailbox] = deleteQueue.value.splice(queueIndex, 1)
+    const accountKey = mailboxDeleteAccountKey(mailbox)
+    activeDeleteAccounts.add(accountKey)
+    deletingMailboxIDs.value = [...deletingMailboxIDs.value, mailbox.id]
+    void executeMailboxDeletion(mailbox, accountKey)
+  }
+  updateDeleteProgress()
+  if (deleteQueue.value.length || activeDeleteAccounts.size) return
+  deleteQueueRunning = false
+  finishDeleteProgress()
+}
+
+async function executeMailboxDeletion(mailbox, accountKey) {
   try {
-    while (deleteQueue.value.length) {
-      const mailbox = deleteQueue.value[0]
-      deletingMailboxID.value = mailbox.id
-      updateDeleteProgress()
-      try {
-        const suffix = mailbox.localOnly ? '?local_only=1' : ''
-        await api(`/api/mailboxes/${mailbox.id}${suffix}`, { method: 'DELETE' })
-        deleteSucceeded += 1
-        unselectMailbox(mailbox.id)
-        if (selected.value?.id === mailbox.id) {
-          selected.value = null
-          messages.value = []
-        }
-      } catch (err) {
-        deleteFailed += 1
-        deleteLastError = err.message
-      } finally {
-        deleteQueue.value.shift()
-        deletingMailboxID.value = ''
-        await load()
-      }
+    const suffix = mailbox.localOnly ? '?local_only=1' : ''
+    await api(`/api/mailboxes/${mailbox.id}${suffix}`, { method: 'DELETE' })
+    deleteSucceeded += 1
+    unselectMailbox(mailbox.id)
+    if (selected.value?.id === mailbox.id) {
+      selected.value = null
+      messages.value = []
     }
+  } catch (err) {
+    deleteFailed += 1
+    deleteLastError = `${mailbox.email}：${err.message}`
   } finally {
-    deleteQueueRunning = false
-    deletingMailboxID.value = ''
-    finishDeleteProgress()
+    deletingMailboxIDs.value = deletingMailboxIDs.value.filter((id) => id !== mailbox.id)
+    activeDeleteAccounts.delete(accountKey)
+    await load({ silent: true })
+    processDeleteQueue()
   }
 }
 
@@ -1078,7 +1174,7 @@ async function deleteMailbox(mailbox, localOnly) {
   deleteConfirmID.value = mailbox.id
   const text = localOnly
     ? '将先清空本地邮件，再删除本地邮箱记录；Apple 服务器上的隐私邮箱会保留。继续吗？'
-    : `将扫描所属 Apple 账号的全部真实邮件文件夹，只移除收件人为 ${mailbox.email} 的云端邮件，再删除 Apple 隐私邮箱和本地记录。此操作不可恢复，继续吗？`
+    : `将根据本地已同步邮件保存的远端标识，把 ${mailbox.email} 对应的 Apple 邮件移入废纸篓并清空该账号的整个废纸篓，再删除 Apple 隐私邮箱和本地记录。未同步到本地的历史邮件不会参与定位，此操作不可恢复，继续吗？`
   try {
     const confirmed = await confirmAction({
       title: localOnly ? '只删除本地记录' : '彻底删除隐私邮箱',
@@ -1087,7 +1183,12 @@ async function deleteMailbox(mailbox, localOnly) {
       tone: 'danger',
     })
     if (!confirmed) return
-    enqueueMailboxDeletions([{ id: mailbox.id, email: mailbox.email, localOnly }])
+    enqueueMailboxDeletions([{
+      id: mailbox.id,
+      email: mailbox.email,
+      account_id: mailbox.account_id || mailbox.accountID || '',
+      localOnly,
+    }])
   } finally {
     deleteConfirmID.value = ''
   }
@@ -1114,6 +1215,7 @@ function handlePageKeydown(event) {
   else if (quickEditOpen.value) closeQuickEdit()
   else if (showImport.value) showImport.value = false
   else if (showSync.value) showSync.value = false
+  else if (showBulkDelete.value) closeBulkDeleteDialog()
   else if (selected.value) selected.value = null
 }
 
@@ -1123,8 +1225,8 @@ watch(query, () => {
 })
 watch(accountID, () => { page.value = 1; load() })
 watch(status, () => { page.value = 1; load() })
-watch([selected, codeDialogOpen, quickEditOpen, showImport, showSync], ([mailbox, codeOpen, quickEditOpenValue, importOpen, syncOpen]) => {
-  document.body.style.overflow = mailbox || codeOpen || quickEditOpenValue || importOpen || syncOpen ? 'hidden' : ''
+watch([selected, codeDialogOpen, quickEditOpen, showImport, showSync, showBulkDelete], ([mailbox, codeOpen, quickEditOpenValue, importOpen, syncOpen, bulkDeleteOpen]) => {
+  document.body.style.overflow = mailbox || codeOpen || quickEditOpenValue || importOpen || syncOpen || bulkDeleteOpen ? 'hidden' : ''
 })
 watch(selected, (value) => {
   if (!value) selectedMessage.value = null
@@ -1170,6 +1272,7 @@ onBeforeUnmount(() => {
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing')" @click="openSyncDialog"><LoaderCircle v-if="isBusy('sync-existing')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync-existing') ? '正在同步邮箱' : '同步已有邮箱' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('import')" @click="openImportDialog"><LoaderCircle v-if="isBusy('import')" :size="14" class="animate-spin" /><MailPlus v-else :size="14" />{{ isBusy('import') ? '正在导入邮箱' : '导入本地邮箱' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="扫描并彻底删除全部 Apple 账号的云端和本地邮件" @click="cleanAllAppleMail"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed || 0}/${appleMailCleanup.total_accounts || 0}` : '全部彻底清理 Apple 邮件' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="isBusy('bulk-delete-resolve')" title="按邮箱地址批量彻底删除 Apple 云端和本地邮箱" @click="openBulkDeleteDialog"><Trash2 :size="14" />批量删除指定邮箱</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="!selectedDeletableCount || deleteConfirmID === 'selected'" :title="selectedDeletableCount ? `彻底删除选中的 ${selectedDeletableCount} 个邮箱` : '请先选择未进入删除队列的邮箱'" @click="removeSelectedMailboxes"><LoaderCircle v-if="deleteConfirmID === 'selected'" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />删除选中{{ selectedDeletableCount ? `（${selectedDeletableCount}）` : '' }}</button>
         </div>
       </div>
@@ -1194,7 +1297,7 @@ onBeforeUnmount(() => {
                   <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': rowBusyAction(mailbox.id) === 'sync' }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="同步该邮箱的最新邮件" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'sync'" :size="12" class="animate-spin" /><RefreshCw v-else :size="12" />同步</button>
                   <button class="mailbox-action-button mailbox-action-code" :class="{ 'mailbox-action-code-selected': rowBusyAction(mailbox.id) === 'code' || (codeDialogOpen && codeMailbox?.id === mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="12" class="animate-spin" /><KeyRound v-else :size="12" />取码</button>
                   <button class="mailbox-action-button mailbox-action-detail" :class="{ 'mailbox-action-detail-selected': selected?.id === mailbox.id }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'detail'" :size="12" class="animate-spin" /><MailOpen v-else :size="12" />详情</button>
-                  <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="deletingMailboxID === mailbox.id ? '正在扫描并删除该邮箱的邮件' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '扫描全部文件夹，只清理该邮箱的邮件后彻底删除'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="deletingMailboxID === mailbox.id" :size="12" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="12" class="animate-spin" /><Trash2 v-else :size="12" />{{ deletingMailboxID === mailbox.id ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
+                  <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="isMailboxDeleting(mailbox.id) ? '正在清理已同步邮件并删除隐私邮箱' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '清理已同步的远端邮件后彻底删除隐私邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="isMailboxDeleting(mailbox.id)" :size="12" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="12" class="animate-spin" /><Trash2 v-else :size="12" />{{ isMailboxDeleting(mailbox.id) ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
                 </div>
               </td>
             </tr>
@@ -1224,6 +1327,17 @@ onBeforeUnmount(() => {
           <header class="mailbox-dialog-heading"><div><h2 id="sync-mailboxes-title"><CloudDownload :size="18" />同步已有邮箱</h2><p>从所选 Apple 账号读取已有隐私邮箱，并更新到本地邮箱池。</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('sync-existing')" @click="showSync = false"><X :size="16" /></button></header>
           <div class="mailbox-sync-fields"><div class="form-group"><span class="form-label">同步范围</span><CardSelect v-model="syncAccountID" :options="syncAccountOptions" aria-label="同步范围" /><span class="form-help">同步使用账号已保存的 iCloud Web 旧接口登录态。</span></div></div>
           <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('sync-existing')" @click="showSync = false">取消</button><button class="primary-button" :disabled="isBusy('sync-existing')"><LoaderCircle v-if="isBusy('sync-existing')" :size="15" class="animate-spin" /><CloudDownload v-else :size="15" />{{ isBusy('sync-existing') ? '同步中' : '开始同步' }}</button></footer>
+        </form>
+      </div>
+
+      <div v-if="showBulkDelete" class="mailbox-dialog-backdrop" role="presentation" @click.self="closeBulkDeleteDialog">
+        <form class="panel mailbox-operation-dialog mailbox-bulk-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="bulk-delete-mailboxes-title" @submit.prevent="submitBulkDeleteEmails">
+          <header class="mailbox-dialog-heading"><div><h2 id="bulk-delete-mailboxes-title"><Trash2 :size="18" />批量删除指定邮箱</h2><p>一行输入一个邮箱。提交后会根据本地已同步邮件的远端标识逐个清理 Apple 邮件、清空所属账号的整个废纸篓，再删除 Apple 隐私邮箱、本地邮件和邮箱记录。</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('bulk-delete-resolve')" @click="closeBulkDeleteDialog"><X :size="16" /></button></header>
+          <div class="mailbox-bulk-delete-fields">
+            <label class="form-group"><span class="form-label">邮箱地址列表</span><textarea v-model="bulkDeleteEmails" class="field mailbox-bulk-delete-input" placeholder="example1@icloud.com&#10;example2@icloud.com" spellcheck="false" autofocus required /><span class="form-help">已识别 {{ bulkDeleteEmailCount }} 个邮箱；重复地址会自动合并。</span></label>
+            <div v-if="bulkDeleteError" class="mailbox-bulk-delete-error" role="alert">{{ bulkDeleteError }}</div>
+          </div>
+          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('bulk-delete-resolve')" @click="closeBulkDeleteDialog">取消</button><button class="primary-button mailbox-bulk-delete-submit" :disabled="isBusy('bulk-delete-resolve') || !bulkDeleteEmailCount"><LoaderCircle v-if="isBusy('bulk-delete-resolve')" :size="15" class="animate-spin" /><Trash2 v-else :size="15" />{{ isBusy('bulk-delete-resolve') ? '正在读取邮箱' : `开始彻底删除（${bulkDeleteEmailCount}）` }}</button></footer>
         </form>
       </div>
     </Teleport>
@@ -1284,12 +1398,12 @@ onBeforeUnmount(() => {
           </section>
 
           <section class="rounded-xl border border-rose-200/70 bg-white p-3 dark:border-rose-950 dark:bg-slate-900">
-            <div class="mb-2.5"><h3 class="text-xs font-black text-slate-700 dark:text-slate-200">清理与删除</h3><p class="mt-0.5 text-[10px] leading-4 text-slate-400">彻底删除会扫描全部 Apple 邮件文件夹，只清理当前隐私邮箱的邮件，再删除 Apple 邮箱及本地记录。</p></div>
-            <div class="detail-setting-grid"><label class="detail-setting-row"><span><strong>移动已同步邮件</strong><small>移入 Apple 废纸篓</small></span><input v-model="remoteClean.move_synced" class="detail-switch" type="checkbox" /></label><label class="detail-setting-row"><span><strong>清空废纸篓</strong><small>彻底清除废纸篓邮件</small></span><input v-model="remoteClean.empty_trash" class="detail-switch" type="checkbox" /></label></div>
+            <div class="mb-2.5"><h3 class="text-xs font-black text-slate-700 dark:text-slate-200">清理与删除</h3><p class="mt-0.5 text-[10px] leading-4 text-slate-400">彻底删除会精确清理本地已同步的远端邮件并清空所属账号废纸篓，再删除 Apple 隐私邮箱及本地记录。</p></div>
+            <div class="detail-setting-grid"><label class="detail-setting-row"><span><strong>移动已同步邮件</strong><small>移入 Apple 废纸篓</small></span><input v-model="remoteClean.move_synced" class="detail-switch" type="checkbox" /></label><label class="detail-setting-row"><span><strong>清空整个废纸篓</strong><small>彻底清除该 Apple 账号的废纸篓邮件</small></span><input v-model="remoteClean.empty_trash" class="detail-switch" type="checkbox" /></label></div>
             <div class="mt-2 grid gap-2 sm:grid-cols-2">
               <button class="detail-button detail-button-secondary sm:col-span-2" :disabled="isBusy('clean') || isMailboxDeleteBusy(selected.id) || (!remoteClean.move_synced && !remoteClean.empty_trash)" @click="cleanRemote"><LoaderCircle v-if="isBusy('clean')" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />清理 Apple 远端邮件</button>
-              <button class="detail-button detail-button-danger" :disabled="isMailboxDeleteBusy(selected.id)" @click="removeMailbox(false)"><LoaderCircle v-if="isMailboxDeleteBusy(selected.id)" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />{{ deletingMailboxID === selected.id ? '删除中' : isMailboxDeleteQueued(selected.id) ? '排队中' : '彻底删除' }}</button>
-              <button class="detail-button detail-button-ghost" :disabled="isMailboxDeleteBusy(selected.id)" @click="removeMailbox(true)"><LoaderCircle v-if="isMailboxDeleteBusy(selected.id)" :size="14" class="animate-spin" /><ShieldX v-else :size="14" />{{ deletingMailboxID === selected.id ? '删除中' : isMailboxDeleteQueued(selected.id) ? '排队中' : '只删本地' }}</button>
+              <button class="detail-button detail-button-danger" :disabled="isMailboxDeleteBusy(selected.id)" @click="removeMailbox(false)"><LoaderCircle v-if="isMailboxDeleteBusy(selected.id)" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />{{ isMailboxDeleting(selected.id) ? '删除中' : isMailboxDeleteQueued(selected.id) ? '排队中' : '彻底删除' }}</button>
+              <button class="detail-button detail-button-ghost" :disabled="isMailboxDeleteBusy(selected.id)" @click="removeMailbox(true)"><LoaderCircle v-if="isMailboxDeleteBusy(selected.id)" :size="14" class="animate-spin" /><ShieldX v-else :size="14" />{{ isMailboxDeleting(selected.id) ? '删除中' : isMailboxDeleteQueued(selected.id) ? '排队中' : '只删本地' }}</button>
             </div>
           </section>
         </div>

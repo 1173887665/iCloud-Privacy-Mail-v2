@@ -13,7 +13,7 @@ const showLogin = ref(false)
 const showIMAP = ref(false)
 const showCreate = ref(false)
 const showPassword = ref(true)
-const showIMAPPassword = ref(false)
+const showIMAPPassword = ref(true)
 const data = ref({ items: [], module_ready: true })
 const selected = ref(null)
 const pending = reactive({ id: '', code: '', phoneNumber: '' })
@@ -118,8 +118,9 @@ function openIMAPDialog() {
   }
   showLogin.value = false
   showCreate.value = false
-  showIMAPPassword.value = false
-  imap.email = selected.value.apple_id || imap.email
+  showIMAPPassword.value = true
+  imap.email = selected.value.imap_email || selected.value.apple_id || ''
+  imap.app_password = selected.value.imap_app_password || ''
   showIMAP.value = true
 }
 
@@ -140,7 +141,14 @@ async function load(options = {}) {
     data.value = await api('/api/apple-accounts')
     if (selected.value) {
       const current = data.value.items.find((item) => item.id === selected.value.id)
-      if (current) selected.value = { ...current, password: selected.value.password || '' }
+      if (current) {
+        selected.value = {
+          ...current,
+          password: selected.value.password || '',
+          imap_email: selected.value.imap_email || '',
+          imap_app_password: selected.value.imap_app_password || '',
+        }
+      }
       else selected.value = null
     }
   } catch (err) {
@@ -198,7 +206,8 @@ async function selectAccount(account) {
   try {
     const result = await api(`/api/apple-accounts/${account.id}`)
     selected.value = result.account
-    imap.email = result.account.apple_id || ''
+    imap.email = result.account.imap_email || result.account.apple_id || ''
+    imap.app_password = result.account.imap_app_password || ''
   } catch (err) {
     flash(err.message, true)
   } finally {
@@ -266,7 +275,7 @@ async function saveIMAP() {
     const result = await api(`/api/apple-accounts/${selected.value.id}/imap`, { method: 'POST', body: JSON.stringify(imap) })
     selected.value = result.account
     imap.app_password = ''
-    showIMAPPassword.value = false
+    showIMAPPassword.value = true
     showIMAP.value = false
     flash('IMAP App 专用密码已验证并保存')
     await load()

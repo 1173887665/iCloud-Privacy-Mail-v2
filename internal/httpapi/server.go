@@ -119,6 +119,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/apple-mail/cleanup/cancel", s.protected(s.handleAppleMailCleanupCancel))
 	s.mux.HandleFunc("GET /api/mailboxes", s.protected(s.handleMailboxes))
 	s.mux.HandleFunc("POST /api/mailboxes", s.protected(s.handleImportMailbox))
+	s.mux.HandleFunc("POST /api/mailboxes/resolve", s.protected(s.handleMailboxResolve))
 	s.mux.HandleFunc("POST /api/mailboxes/remote-clean", s.protected(s.handleMailboxesRemoteClean))
 	s.mux.HandleFunc("GET /api/mailboxes/{id}", s.protected(s.handleMailbox))
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/status", s.protected(s.handleMailboxStatus))
@@ -666,6 +667,45 @@ func (s *Server) handleMailboxes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": result})
 }
 
+func (s *Server) handleMailboxResolve(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Emails []string `json:"emails"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	type resolvedMailbox struct {
+		ID        string `json:"id"`
+		Email     string `json:"email"`
+		AccountID string `json:"account_id"`
+	}
+	items := make([]resolvedMailbox, 0, len(body.Emails))
+	missing := make([]string, 0)
+	seen := make(map[string]struct{}, len(body.Emails))
+	for _, value := range body.Emails {
+		email := strings.ToLower(strings.TrimSpace(value))
+		if email == "" {
+			continue
+		}
+		if _, exists := seen[email]; exists {
+			continue
+		}
+		seen[email] = struct{}{}
+		mailbox, ok := s.store.FindMailboxByEmail(email)
+		if !ok {
+			missing = append(missing, email)
+			continue
+		}
+		items = append(items, resolvedMailbox{ID: mailbox.ID, Email: mailbox.Email, AccountID: mailbox.AccountID})
+	}
+	if len(seen) == 0 {
+		writeError(w, http.StatusBadRequest, "email_list_empty", "请至少输入一个邮箱地址")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"items": items, "missing": missing}})
+}
+
 func (s *Server) handleMailbox(w http.ResponseWriter, r *http.Request) {
 	mailbox, ok := s.store.FindMailboxByID(r.PathValue("id"))
 	if !ok {
@@ -813,7 +853,7 @@ func (s *Server) handleMailboxDelete(w http.ResponseWriter, r *http.Request) {
 	if parseBool(r.URL.Query().Get("local_only")) {
 		err = s.mailbox.DeleteLocal(r.PathValue("id"))
 	} else {
-		err = s.mailbox.DeleteRemote(r.Context(), r.PathValue("id"))
+		err = s.mailbox.DeleteCompletely(r.Context(), r.PathValue("id"))
 	}
 	if err != nil {
 		writeServiceError(w, err)

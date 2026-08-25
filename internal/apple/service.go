@@ -58,7 +58,9 @@ type LoginStateSummary struct {
 
 type AccountSummary struct {
 	domain.AppleAccount
-	LoginStates []LoginStateSummary `json:"login_states"`
+	LoginStates     []LoginStateSummary `json:"login_states"`
+	IMAPEmail       string              `json:"imap_email,omitempty"`
+	IMAPAppPassword string              `json:"imap_app_password,omitempty"`
 }
 
 func NewService(cfg config.Config, state *store.Store) *Service {
@@ -181,7 +183,7 @@ func (s *Service) Account(accountID string) (AccountSummary, error) {
 	}
 	summary := AccountSummary{AppleAccount: account, LoginStates: []LoginStateSummary{}}
 	if session, ok := s.store.ICloudSessionByAccountID(accountID); ok {
-		summary.LoginStates = publicLoginStates(session)
+		summary = accountSummaryWithSession(account, session)
 	}
 	return summary, nil
 }
@@ -281,7 +283,17 @@ func (s *Service) KeepAliveState(ctx context.Context, state domain.LoginState) (
 
 func (s *Service) summaryForSession(session domain.ICloudSession) AccountSummary {
 	account, _ := s.store.FindAppleAccount(session.AccountID)
-	return AccountSummary{AppleAccount: account, LoginStates: publicLoginStates(session)}
+	return accountSummaryWithSession(account, session)
+}
+
+// accountSummaryWithSession 生成单账号操作响应，并附带已解密的 IMAP 凭据。
+func accountSummaryWithSession(account domain.AppleAccount, session domain.ICloudSession) AccountSummary {
+	summary := AccountSummary{AppleAccount: account, LoginStates: publicLoginStates(session)}
+	if state, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP); ok {
+		summary.IMAPEmail = state.IMAPEmail
+		summary.IMAPAppPassword = state.IMAPAppPassword
+	}
+	return summary
 }
 
 func publicLoginStates(session domain.ICloudSession) []LoginStateSummary {

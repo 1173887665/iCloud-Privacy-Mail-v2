@@ -33,7 +33,6 @@ type Service struct {
 type remoteMailboxDeleteClient interface {
 	ListPrivacyMailboxes(context.Context, protocol.ICloudSession) ([]protocol.ICloudRemoteMailbox, error)
 	DeletePrivacyMailbox(context.Context, protocol.ICloudSession, string) error
-	CleanRemoteMailForAddress(context.Context, protocol.ICloudSession, string) (protocol.ICloudAddressMailCleanupResult, error)
 	MoveRemoteMessagesToTrash(context.Context, protocol.ICloudSession, []string) (protocol.ICloudMailCleanupResult, error)
 	EmptyTrash(context.Context, protocol.ICloudSession) (int, error)
 }
@@ -229,7 +228,8 @@ func (s *Service) SyncRemote(ctx context.Context, accountID string) ([]domain.Ma
 	return out, nil
 }
 
-func (s *Service) DeleteRemote(ctx context.Context, mailboxID string) error {
+// DeleteCompletely 使用统一流程清理已同步的远端邮件、删除 Apple 隐私邮箱并清理本地数据。
+func (s *Service) DeleteCompletely(ctx context.Context, mailboxID string) error {
 	mailbox, ok := s.store.FindMailboxByID(mailboxID)
 	if !ok {
 		return errors.New("邮箱不存在")
@@ -238,12 +238,16 @@ func (s *Service) DeleteRemote(ctx context.Context, mailboxID string) error {
 	if !ok {
 		return errors.New("对应 Apple 账号登录态不存在")
 	}
-	if err := s.cleanupMailboxMessagesBeforeDelete(ctx, mailbox, session); err != nil {
-		return err
-	}
 	client := s.deleteClient
 	if client == nil {
 		client = s.client
+	}
+	if _, err := s.cleanRemoteMessages(ctx, client, mailbox, session, RemoteCleanupOptions{
+		MoveSynced: true,
+		EmptyTrash: true,
+		PurgeLocal: true,
+	}); err != nil {
+		return fmt.Errorf("删除隐私邮箱前清理已同步的 Apple 远端邮件失败：%w", err)
 	}
 	remotes, err := client.ListPrivacyMailboxes(ctx, session)
 	if err != nil {
@@ -272,20 +276,6 @@ func (s *Service) DeleteLocal(mailboxID string) error {
 	return s.store.DeleteMailbox(mailboxID)
 }
 
-func (s *Service) cleanupMailboxMessagesBeforeDelete(ctx context.Context, mailbox domain.Mailbox, session protocol.ICloudSession) error {
-	client := s.deleteClient
-	if client == nil {
-		client = s.client
-	}
-	if _, err := client.CleanRemoteMailForAddress(ctx, session, mailbox.Email); err != nil {
-		return fmt.Errorf("删除邮箱前清理 Apple 远端邮件失败：%w", err)
-	}
-	if _, err := s.store.DeleteMailboxMessages(mailbox.ID); err != nil {
-		return fmt.Errorf("删除邮箱前清理本地邮件失败：%w", err)
-	}
-	return nil
-}
-
 func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, options RemoteCleanupOptions) (protocol.ICloudMailCleanupResult, error) {
 	mailbox, ok := s.store.FindMailboxByID(mailboxID)
 	if !ok {
@@ -300,31 +290,21 @@ func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, opt
 	if client == nil {
 		client = s.client
 	}
+	return s.cleanRemoteMessages(ctx, client, mailbox, session, options)
+}
+
+// cleanRemoteMessages 是详情清理和彻底删除共同使用的已同步邮件清理实现。
+func (s *Service) cleanRemoteMessages(ctx context.Context, client remoteMailboxDeleteClient, mailbox domain.Mailbox, session protocol.ICloudSession, options RemoteCleanupOptions) (protocol.ICloudMailCleanupResult, error) {
 	result := protocol.ICloudMailCleanupResult{}
 	if options.MoveSynced {
-		moved, err := client.MoveRemoteMessagesToTrash(ctx, session, remoteMessageIDs(s.store.MessagesForMailbox(mailboxID)))
+		moved, err := client.MoveRemoteMessagesToTrash(ctx, session, remoteMessageIDs(s.store.MessagesForMailbox(mailbox.ID)))
 		result.MovedToTrash += moved.MovedToTrash
 		result.Skipped += moved.Skipped
 		if err != nil {
 			return result, err
 		}
-		var removed int
-		if options.PurgeLocal {
-			removed, err = s.store.DeleteMailboxMessages(mailboxID)
-		} else {
-			localIDs := append(append([]string(nil), moved.MovedRemoteIDs...), moved.AbsentRemoteIDs...)
-			removed, err = s.store.DeleteMailboxMessagesByRemoteIDs(mailboxID, localIDs)
-		}
-		if err != nil {
-			return result, err
-		}
-		result.LocalRemoved += removed
-	} else if options.PurgeLocal {
-		removed, err := s.store.DeleteMailboxMessages(mailboxID)
-		if err != nil {
-			return result, err
-		}
-		result.LocalRemoved += removed
+		result.MovedRemoteIDs = append(result.MovedRemoteIDs, moved.MovedRemoteIDs...)
+		result.AbsentRemoteIDs = append(result.AbsentRemoteIDs, moved.AbsentRemoteIDs...)
 	}
 	if options.EmptyTrash {
 		destroyed, err := client.EmptyTrash(ctx, session)
@@ -332,6 +312,20 @@ func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, opt
 		if err != nil {
 			return result, err
 		}
+	}
+	if options.PurgeLocal {
+		removed, err := s.store.DeleteMailboxMessages(mailbox.ID)
+		if err != nil {
+			return result, err
+		}
+		result.LocalRemoved += removed
+	} else if options.MoveSynced {
+		localIDs := append(append([]string(nil), result.MovedRemoteIDs...), result.AbsentRemoteIDs...)
+		removed, err := s.store.DeleteMailboxMessagesByRemoteIDs(mailbox.ID, localIDs)
+		if err != nil {
+			return result, err
+		}
+		result.LocalRemoved += removed
 	}
 	return result, nil
 }
