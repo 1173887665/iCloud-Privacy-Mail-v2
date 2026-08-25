@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Boxes, ChevronLeft, ChevronRight, Clipboard, CloudDownload, CloudOff, KeyRound, LoaderCircle, MailOpen, MailPlus, RefreshCw, Save, Search, ShieldX, Trash2, X } from '@lucide/vue'
+import { Boxes, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Clipboard, CloudDownload, CloudOff, KeyRound, LoaderCircle, MailOpen, MailPlus, RefreshCw, Save, Search, ShieldX, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
 import FormDialog from '../components/FormDialog.vue'
@@ -1202,10 +1202,16 @@ async function removeMailboxFromRow(mailbox) {
   return deleteMailbox(mailbox, false)
 }
 
-function move(delta) {
+function goToPage(targetPage) {
   if (loading.value) return
-  page.value = Math.max(1, Math.min(result.value.total_pages, page.value + delta))
+  const nextPage = Math.max(1, Math.min(result.value.total_pages, targetPage))
+  if (nextPage === page.value) return
+  page.value = nextPage
   load()
+}
+
+function move(delta) {
+  goToPage(page.value + delta)
 }
 
 function handlePageKeydown(event) {
@@ -1305,7 +1311,7 @@ onBeforeUnmount(() => {
           </tbody>
         </table>
       </div>
-      <div ref="mailboxPagination" class="mailbox-pagination"><span>第 {{ result.page }} / {{ result.total_pages }} 页　总 {{ result.total }} 个邮箱</span><div><button type="button" class="secondary-button" :disabled="loading || result.page <= 1" title="上一页" aria-label="上一页" @click="move(-1)"><ChevronLeft :size="15" /></button><button type="button" class="secondary-button" :disabled="loading || result.page >= result.total_pages" title="下一页" aria-label="下一页" @click="move(1)"><ChevronRight :size="15" /></button></div></div>
+      <div ref="mailboxPagination" class="mailbox-pagination"><span>第 {{ result.page }} / {{ result.total_pages }} 页　总 {{ result.total }} 个邮箱</span><div><button type="button" class="secondary-button" :disabled="loading || result.page <= 1" title="跳转到首页" aria-label="跳转到首页" @click="goToPage(1)"><ChevronsLeft :size="15" /></button><button type="button" class="secondary-button" :disabled="loading || result.page <= 1" title="上一页" aria-label="上一页" @click="move(-1)"><ChevronLeft :size="15" /></button><button type="button" class="secondary-button" :disabled="loading || result.page >= result.total_pages" title="下一页" aria-label="下一页" @click="move(1)"><ChevronRight :size="15" /></button><button type="button" class="secondary-button" :disabled="loading || result.page >= result.total_pages" title="跳转到末页" aria-label="跳转到末页" @click="goToPage(result.total_pages)"><ChevronsRight :size="15" /></button></div></div>
     </section>
 
     <Teleport to="body">
