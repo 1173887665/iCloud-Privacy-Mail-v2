@@ -19,6 +19,8 @@ const mailboxSyncHeartbeatInterval = time.Minute
 // MailboxSyncMessage 是一次同步中准备写入的标准邮件。
 type MailboxSyncMessage struct {
 	RemoteID    string
+	RemoteIDs   []string
+	CanonicalID string
 	Source      string
 	Subject     string
 	From        string
@@ -103,6 +105,7 @@ func (s *Store) UpsertMailboxFromRemote(accountID string, remote domain.RemoteMa
 		mailbox.AccountID = firstNonEmpty(accountID, mailbox.AccountID)
 		mailbox.AnonymousID = firstNonEmpty(remote.AnonymousID, mailbox.AnonymousID)
 		mailbox.RemoteOrigin = firstNonEmpty(remote.Origin, mailbox.RemoteOrigin)
+		mailbox.ForwardToEmail = firstNonEmpty(strings.ToLower(strings.TrimSpace(remote.ForwardToEmail)), mailbox.ForwardToEmail)
 		if strings.TrimSpace(remote.Label) != "" {
 			mailbox.Label = strings.TrimSpace(remote.Label)
 		}
@@ -146,7 +149,7 @@ func (s *Store) UpsertMailboxFromRemote(accountID string, remote domain.RemoteMa
 	mailbox = domain.Mailbox{
 		ID: id, OwnerID: ownerID, AccountID: strings.TrimSpace(accountID), AnonymousID: strings.TrimSpace(remote.AnonymousID),
 		RemoteOrigin: strings.TrimSpace(remote.Origin), Label: firstNonEmpty(remote.Label, "隐私邮箱 "+now.Format("0102-150405")),
-		Email: email, APIToken: token, APIActive: true, ICloudActive: remote.IsActive, Status: status,
+		Email: email, ForwardToEmail: strings.ToLower(strings.TrimSpace(remote.ForwardToEmail)), APIToken: token, APIActive: true, ICloudActive: remote.IsActive, Status: status,
 		Note: firstNonEmpty(remote.Note, defaultNote), CreatedAt: now, UpdatedAt: now,
 	}
 	mailboxChange, _, err := s.upsertEntityTx(tx, "mailboxes", "mailbox", mailbox.ID, mailbox)
@@ -343,6 +346,13 @@ func (s *Store) UpsertMessage(mailboxID, remoteID, source, subject, from, body s
 }
 
 func (s *Store) upsertMessageTx(tx *sql.Tx, mailboxID, remoteID, source, subject, from, body, htmlBody, contentType string, receivedAt time.Time) (domain.Message, bool, domain.Mailbox, []Change, error) {
+	return s.upsertMessageDetailedTx(tx, mailboxID, MailboxSyncMessage{
+		RemoteID: remoteID, RemoteIDs: []string{remoteID}, Source: source, Subject: subject, From: from,
+		Body: body, HTMLBody: htmlBody, ContentType: contentType, ReceivedAt: receivedAt,
+	})
+}
+
+func (s *Store) upsertMessageDetailedTx(tx *sql.Tx, mailboxID string, incoming MailboxSyncMessage) (domain.Message, bool, domain.Mailbox, []Change, error) {
 	var mailbox domain.Mailbox
 	if found, err := s.readEntityTx(tx, "mailboxes", mailboxID, &mailbox); err != nil || !found {
 		if err != nil {
@@ -350,27 +360,50 @@ func (s *Store) upsertMessageTx(tx *sql.Tx, mailboxID, remoteID, source, subject
 		}
 		return domain.Message{}, false, mailbox, nil, errors.New("邮箱不存在")
 	}
-	remoteID = strings.TrimSpace(remoteID)
-	if remoteID != "" {
+	remoteID := strings.TrimSpace(incoming.RemoteID)
+	canonicalID := strings.TrimSpace(incoming.CanonicalID)
+	remoteIDs := uniqueNonEmptyStrings(append(append([]string(nil), incoming.RemoteIDs...), remoteID))
+	if remoteID != "" || canonicalID != "" {
 		var data []byte
-		err := tx.QueryRow(`SELECT data_json FROM messages WHERE json_extract(data_json, '$.mailbox_id') = ? AND json_extract(data_json, '$.remote_id') = ? LIMIT 1`, mailboxID, remoteID).Scan(&data)
+		err := sql.ErrNoRows
+		if canonicalID != "" {
+			err = tx.QueryRow(`SELECT data_json FROM messages WHERE json_extract(data_json, '$.mailbox_id') = ? AND json_extract(data_json, '$.canonical_id') = ? LIMIT 1`, mailboxID, canonicalID).Scan(&data)
+		}
+		if errors.Is(err, sql.ErrNoRows) && remoteID != "" {
+			err = tx.QueryRow(`SELECT data_json FROM messages WHERE json_extract(data_json, '$.mailbox_id') = ? AND json_extract(data_json, '$.remote_id') = ? LIMIT 1`, mailboxID, remoteID).Scan(&data)
+		}
+		if errors.Is(err, sql.ErrNoRows) && remoteID != "" {
+			err = tx.QueryRow(`SELECT data_json FROM messages
+				WHERE json_extract(data_json, '$.mailbox_id') = ?
+				AND EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(data_json, '$.remote_ids'), '[]')) WHERE value = ?)
+				LIMIT 1`, mailboxID, remoteID).Scan(&data)
+		}
 		if err == nil {
 			var existing domain.Message
 			if err := s.decodeEntity("messages", data, &existing); err != nil {
 				return domain.Message{}, false, mailbox, nil, err
 			}
 			changed := false
-			if strings.TrimSpace(existing.ContentType) == "" && strings.TrimSpace(contentType) != "" {
-				existing.ContentType = strings.TrimSpace(contentType)
+			if existing.CanonicalID == "" && canonicalID != "" {
+				existing.CanonicalID = canonicalID
 				changed = true
 			}
-			if strings.TrimSpace(htmlBody) != "" && existing.HTMLBody != htmlBody {
-				existing.HTMLBody = htmlBody
+			mergedRemoteIDs := uniqueNonEmptyStrings(append(append([]string(nil), existing.RemoteIDs...), remoteIDs...))
+			if !equalStrings(existing.RemoteIDs, mergedRemoteIDs) {
+				existing.RemoteIDs = mergedRemoteIDs
+				changed = true
+			}
+			if strings.TrimSpace(existing.ContentType) == "" && strings.TrimSpace(incoming.ContentType) != "" {
+				existing.ContentType = strings.TrimSpace(incoming.ContentType)
+				changed = true
+			}
+			if strings.TrimSpace(incoming.HTMLBody) != "" && existing.HTMLBody != incoming.HTMLBody {
+				existing.HTMLBody = incoming.HTMLBody
 				existing.ContentType = "text/html"
 				changed = true
 			}
-			if strings.TrimSpace(body) != "" && (strings.TrimSpace(existing.Body) == "" || changed) && existing.Body != body {
-				existing.Body = body
+			if strings.TrimSpace(incoming.Body) != "" && (strings.TrimSpace(existing.Body) == "" || changed) && existing.Body != incoming.Body {
+				existing.Body = incoming.Body
 				changed = true
 			}
 			if !changed {
@@ -391,14 +424,18 @@ func (s *Store) upsertMessageTx(tx *sql.Tx, mailboxID, remoteID, source, subject
 		return domain.Message{}, false, mailbox, nil, err
 	}
 	now := time.Now()
-	if receivedAt.IsZero() {
-		receivedAt = now
+	if incoming.ReceivedAt.IsZero() {
+		incoming.ReceivedAt = now
 	}
-	contentType = strings.TrimSpace(contentType)
+	contentType := strings.TrimSpace(incoming.ContentType)
 	if contentType == "" {
 		contentType = "text/plain"
 	}
-	message := domain.Message{ID: id, OwnerID: mailbox.OwnerID, MailboxID: mailboxID, RemoteID: remoteID, Source: strings.TrimSpace(source), Subject: strings.TrimSpace(subject), From: strings.TrimSpace(from), Body: body, HTMLBody: htmlBody, ContentType: contentType, ReceivedAt: receivedAt, CreatedAt: now}
+	message := domain.Message{
+		ID: id, OwnerID: mailbox.OwnerID, MailboxID: mailboxID, RemoteID: remoteID, RemoteIDs: remoteIDs, CanonicalID: canonicalID,
+		Source: strings.TrimSpace(incoming.Source), Subject: strings.TrimSpace(incoming.Subject), From: strings.TrimSpace(incoming.From),
+		Body: incoming.Body, HTMLBody: incoming.HTMLBody, ContentType: contentType, ReceivedAt: incoming.ReceivedAt, CreatedAt: now,
+	}
 	change, _, err := s.upsertEntityTx(tx, "messages", "message", message.ID, message)
 	if err != nil {
 		return domain.Message{}, false, mailbox, nil, err
@@ -409,6 +446,14 @@ func (s *Store) upsertMessageTx(tx *sql.Tx, mailboxID, remoteID, source, subject
 
 // ApplyMailboxSyncBatch 使用一个 SQLite 事务写入整组邮箱同步结果，并只发布一条批量 SSE。
 func (s *Store) ApplyMailboxSyncBatch(updates []MailboxSyncUpdate) (int, error) {
+	return s.applyMailboxSyncBatch(updates, "", nil)
+}
+
+func (s *Store) ApplyMailboxSyncBatchWithRuntimeState(updates []MailboxSyncUpdate, stateID string, state any) (int, error) {
+	return s.applyMailboxSyncBatch(updates, strings.TrimSpace(stateID), state)
+}
+
+func (s *Store) applyMailboxSyncBatch(updates []MailboxSyncUpdate, stateID string, state any) (int, error) {
 	if len(updates) == 0 {
 		return 0, nil
 	}
@@ -434,7 +479,7 @@ func (s *Store) ApplyMailboxSyncBatch(updates []MailboxSyncUpdate) (int, error) 
 		mailboxChanged := false
 		addedForMailbox := 0
 		for _, incoming := range update.Messages {
-			message, added, _, messageChanges, err := s.upsertMessageTx(tx, mailbox.ID, incoming.RemoteID, incoming.Source, incoming.Subject, incoming.From, incoming.Body, incoming.HTMLBody, incoming.ContentType, incoming.ReceivedAt)
+			message, added, _, messageChanges, err := s.upsertMessageDetailedTx(tx, mailbox.ID, incoming)
 			if err != nil {
 				_ = tx.Rollback()
 				return created, err
@@ -471,13 +516,48 @@ func (s *Store) ApplyMailboxSyncBatch(updates []MailboxSyncUpdate) (int, error) 
 			}
 		}
 	}
-	if created == 0 && updatedMessages == 0 && len(changedMailboxes) == 0 {
+	stateChanged := false
+	if stateID != "" && state != nil {
+		if _, changed, err := s.upsertEntityTx(tx, "runtime_states", "mail-sync", stateID, state); err != nil {
+			_ = tx.Rollback()
+			return created, err
+		} else {
+			stateChanged = changed
+		}
+	}
+	if created == 0 && updatedMessages == 0 && len(changedMailboxes) == 0 && !stateChanged {
 		_ = tx.Rollback()
 		return 0, nil
 	}
 	payload, _ := json.Marshal(map[string]any{"operation": "batch-updated", "created_message_count": created, "updated_message_count": updatedMessages, "items": changedMailboxes, "messages": changedMessages})
 	change := Change{Type: "mailbox.batch-updated", Resource: "mailbox", ResourceID: "batch", Operation: "batch-updated", Payload: payload, CreatedAt: time.Now()}
 	return created, s.commitTx(tx, []Change{change})
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeMailbox(mailbox domain.Mailbox) domain.Mailbox { mailbox.APIToken = ""; return mailbox }
@@ -749,7 +829,12 @@ func (s *Store) DeleteMailboxMessagesByRemoteIDs(mailboxID string, remoteIDs []s
 	}
 	removed := 0
 	for _, remoteID := range targets {
-		result, err := tx.Exec(`DELETE FROM messages WHERE json_extract(data_json, '$.mailbox_id') = ? AND json_extract(data_json, '$.remote_id') = ?`, mailboxID, remoteID)
+		result, err := tx.Exec(`DELETE FROM messages
+			WHERE json_extract(data_json, '$.mailbox_id') = ?
+			AND (
+				json_extract(data_json, '$.remote_id') = ?
+				OR EXISTS (SELECT 1 FROM json_each(COALESCE(json_extract(data_json, '$.remote_ids'), '[]')) WHERE value = ?)
+			)`, mailboxID, remoteID, remoteID)
 		if err != nil {
 			_ = tx.Rollback()
 			return 0, err

@@ -43,6 +43,15 @@ func normalizeICloudWebSession(session ICloudSession) ICloudSession {
 	return session
 }
 
+func CanUseICloudWebMail(session ICloudSession) bool {
+	session = normalizeICloudWebSession(session)
+	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+		return false
+	}
+	_, err := mailGatewayBaseURL(session)
+	return err == nil
+}
+
 func (c *ICloudSessionValidator) ValidateSession(ctx context.Context, session ICloudSession, defaultHost string) (ICloudSession, error) {
 	session = normalizeICloudWebSession(session)
 	result, err := c.Validate(ctx, session.Cookies, firstNonEmpty(session.Host, defaultHost))

@@ -10,6 +10,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"regexp"
@@ -36,6 +37,9 @@ type ICloudRemoteMailbox struct {
 
 type ICloudSyncedMessage struct {
 	RemoteID    string
+	RemoteIDs   []string
+	CanonicalID string
+	Source      string
 	UID         string
 	Subject     string
 	From        string
@@ -1369,14 +1373,23 @@ func (c *ICloudClient) SyncMailboxMessages(ctx context.Context, session ICloudSe
 }
 
 func (c *ICloudClient) SyncMailboxMessagesBatch(ctx context.Context, session ICloudSession, mailboxes []Mailbox, after time.Time, keyword string, maxThreads int) (map[string][]ICloudSyncedMessage, error) {
+	result, err := c.SyncMailboxMessagesBatchWithOptions(ctx, session, mailboxes, MailSyncOptions{
+		Mode:      MailSyncModeVerification,
+		Keyword:   keyword,
+		After:     after,
+		Limit:     maxThreads,
+		UseCursor: true,
+	})
+	return result.MessagesByMailbox, err
+}
+
+func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, session ICloudSession, mailboxes []Mailbox, options MailSyncOptions) (MailSyncBatchResult, error) {
 	session = normalizeICloudWebSession(session)
 	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
-		return nil, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
+		return MailSyncBatchResult{}, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
-	if maxThreads <= 0 || maxThreads > 50 {
-		maxThreads = 50
-	}
-	if keyword = strings.TrimSpace(keyword); keyword == "" {
+	keyword := strings.TrimSpace(options.Keyword)
+	if options.VerificationOnly() && keyword == "" {
 		keyword = "OpenAI"
 	}
 	now := time.Now()
@@ -1389,37 +1402,53 @@ func (c *ICloudClient) SyncMailboxMessagesBatch(ctx context.Context, session ICl
 			continue
 		}
 		aliases[mailbox.ID] = email
-		mailboxAfter := mailboxSyncAfter(mailbox, after, now)
+		mailboxAfter := options.After
+		if options.UseCursor {
+			mailboxAfter = mailboxSyncAfter(mailbox, options.After, now)
+		}
 		afterByMailbox[mailbox.ID] = mailboxAfter
 		if queryAfter.IsZero() || mailboxAfter.Before(queryAfter) {
 			queryAfter = mailboxAfter
 		}
 	}
 	if len(aliases) == 0 {
-		return map[string][]ICloudSyncedMessage{}, nil
+		return MailSyncBatchResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}}, nil
 	}
 	folders, err := c.mailFolders(ctx, session)
 	if err != nil {
-		return nil, err
+		return MailSyncBatchResult{}, err
 	}
 	folders = preferredMailFolders(folders)
 	out := make(map[string][]ICloudSyncedMessage, len(aliases))
+	scanned := 0
+	hasMore := false
+	seenThreads := make(map[string]bool)
 	for _, folder := range folders {
+		maxThreads := mailThreadSearchLimit(folder, options)
 		threads, err := c.searchThreads(ctx, session, folder, maxThreads)
 		if err != nil {
-			return out, err
+			return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out)}, err
+		}
+		if !options.FullScan && len(threads) >= maxThreads {
+			hasMore = true
 		}
 		for _, thread := range threads {
+			threadID := strings.TrimSpace(thread.ThreadID)
+			if threadID == "" || seenThreads[threadID] {
+				continue
+			}
+			seenThreads[threadID] = true
+			scanned++
 			if shouldSkipSyncedThread(thread, queryAfter) {
 				continue
 			}
 			text := thread.Subject + "\n" + thread.Preview
-			if !looksLikeVerificationText(text, keyword) {
+			if options.VerificationOnly() && !looksLikeVerificationText(text, keyword) {
 				continue
 			}
-			messagesByMailbox, err := c.threadMessagesForAliases(ctx, session, folder, thread.ThreadID, aliases, afterByMailbox)
+			messagesByMailbox, err := c.threadMessagesForAliases(ctx, session, folder, threadID, aliases, afterByMailbox)
 			if err != nil {
-				return out, err
+				return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out)}, err
 			}
 			for mailboxID, messages := range messagesByMailbox {
 				out[mailboxID] = append(out[mailboxID], messages...)
@@ -1431,7 +1460,23 @@ func (c *ICloudClient) SyncMailboxMessagesBatch(ctx context.Context, session ICl
 			return out[mailboxID][i].ReceivedAt.After(out[mailboxID][j].ReceivedAt)
 		})
 	}
-	return out, nil
+	return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out), HasMore: hasMore}, nil
+}
+
+func mailThreadSearchLimit(folder mailFolder, options MailSyncOptions) int {
+	if options.FullScan {
+		// 文件夹的邮件数一定不小于会话线程数，用它作为 maxResults 可在一次账号级请求中完整拉取。
+		if folder.MessageCount > 0 {
+			return folder.MessageCount
+		}
+		// iCloud 偶尔会对虚拟 INBOX 省略计数；使用足够大的请求值，避免再次退化为固定 20/50 条。
+		return 100000
+	}
+	limit := options.Limit
+	if limit <= 0 || limit > 50 {
+		return 50
+	}
+	return limit
 }
 
 func mailboxSyncAfter(mailbox Mailbox, after time.Time, now time.Time) time.Time {
@@ -1676,23 +1721,24 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
 		from := addressSummary(meta.From)
 		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
+		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
+		if len(matchedMailboxIDs) == 0 {
+			continue
+		}
 		bodyText := meta.Preview
 		htmlBody := ""
+		longHeader := ""
 		textParts := mailTextParts(meta.Parts)
 		if len(textParts) > 0 {
 			detail, err := c.messageBody(ctx, session, folderName, uid, textParts)
 			if err != nil {
 				return messages, err
 			}
-			recipients += "\n" + detail.LongHeader
+			longHeader = detail.LongHeader
 			if strings.TrimSpace(detail.TextBody) != "" {
 				bodyText = detail.TextBody
 			}
 			htmlBody = detail.HTMLBody
-		}
-		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
-		if len(matchedMailboxIDs) == 0 {
-			continue
 		}
 		if strings.TrimSpace(bodyText) == "" && strings.TrimSpace(htmlBody) != "" {
 			bodyText = normalizeMailBody(htmlBody)
@@ -1703,6 +1749,9 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		}
 		message := ICloudSyncedMessage{
 			RemoteID:    "icloud:" + folderName + ":" + uid,
+			RemoteIDs:   []string{"icloud:" + folderName + ":" + uid},
+			CanonicalID: canonicalMailID(firstNonEmpty(meta.MessageID, mailHeaderValue(longHeader, "Message-ID")), from, meta.Subject, receivedAt),
+			Source:      "icloud",
 			UID:         uid,
 			Subject:     meta.Subject,
 			From:        from,
@@ -1720,6 +1769,19 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		}
 	}
 	return messages, nil
+}
+
+func mailHeaderValue(rawHeader, name string) string {
+	rawHeader = strings.TrimSpace(rawHeader)
+	name = strings.TrimSpace(name)
+	if rawHeader == "" || name == "" {
+		return ""
+	}
+	message, err := mail.ReadMessage(strings.NewReader(rawHeader + "\r\n\r\n"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(message.Header.Get(name))
 }
 
 func matchingMailboxIDs(recipients string, aliases map[string]string) []string {

@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	databaseSchemaVersion = 4
+	databaseSchemaVersion = 5
 	defaultChangeLogLimit = 5000
 	secretPrefix          = "enc:v1:"
 )
@@ -235,6 +235,7 @@ func migrateDatabase(db *sql.DB) error {
 		{version: 2, statements: migrationV2()},
 		{version: 3, statements: migrationV3()},
 		{version: 4, statements: migrationV4()},
+		{version: 5, statements: migrationV5()},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -353,6 +354,15 @@ func migrationV4() []string {
 	return []string{
 		// 清理旧逐邮箱同步和会话访问产生的高频通知；业务实体仍完整保留。
 		`DELETE FROM change_log WHERE event_type IN ('mailbox.updated', 'web-session.updated')`,
+	}
+}
+
+func migrationV5() []string {
+	return []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_canonical ON messages (
+			json_extract(data_json, '$.mailbox_id'),
+			json_extract(data_json, '$.canonical_id')
+		) WHERE COALESCE(json_extract(data_json, '$.canonical_id'), '') <> ''`,
 	}
 }
 

@@ -7,27 +7,41 @@ const placement = ref('bottom')
 const tooltip = ref(null)
 const left = ref(0)
 const top = ref(0)
+const arrowLeft = ref(0)
 let activeTarget = null
 let showTimer = null
 let observer = null
+const tooltipTargetSelector = [
+  '[title]',
+  '[data-tooltip]',
+  'button[aria-label]',
+  'a[aria-label]',
+  '[role="button"][aria-label]',
+  'input[aria-label]',
+  'select[aria-label]',
+  'textarea[aria-label]',
+].join(', ')
 
-// 自动把只有图标的 title 按钮接入统一文字提示，同时保留无障碍名称。
-function enhanceIconButtons(root) {
-  const buttons = []
-  if (root instanceof Element && root.matches('button')) buttons.push(root)
-  if (root instanceof Element) buttons.push(...root.querySelectorAll('button'))
-  for (const button of buttons) {
+// 把全站控件说明接入统一文字提示；iframe 的 title 仍保留给无障碍阅读器。
+function enhanceTooltipTargets(root) {
+  const targets = []
+  if (root instanceof Element && root.matches(tooltipTargetSelector)) targets.push(root)
+  if (root instanceof Element || root instanceof DocumentFragment) targets.push(...root.querySelectorAll(tooltipTargetSelector))
+  for (const target of targets) {
+    if (target.matches('iframe')) continue
     const label = String(
-      button.getAttribute('title')
-      || button.dataset.tooltip
-      || button.getAttribute('aria-label')
+      target.getAttribute('title')
+      || target.dataset.tooltip
+      || target.getAttribute('aria-label')
       || '',
     ).trim()
-    if (!label || button.textContent.trim()) continue
-    if (button.dataset.tooltip !== label) button.dataset.tooltip = label
-    if (!button.getAttribute('aria-label')) button.setAttribute('aria-label', label)
-    if (activeTarget === button && visible.value) text.value = label
-    if (button.hasAttribute('title')) button.removeAttribute('title')
+    if (!label) continue
+    if (target.dataset.tooltip !== label) target.dataset.tooltip = label
+    if (target.matches('button, a, [role="button"]') && !target.textContent.trim() && !target.getAttribute('aria-label')) {
+      target.setAttribute('aria-label', label)
+    }
+    if (activeTarget === target && visible.value) text.value = label
+    if (target.hasAttribute('title')) target.removeAttribute('title')
   }
 }
 
@@ -42,10 +56,12 @@ async function positionTooltip(target) {
   const tooltipRect = tooltip.value.getBoundingClientRect()
   const viewportPadding = 8
   const centeredLeft = targetRect.left + (targetRect.width / 2)
-  left.value = Math.max(
+  const clampedLeft = Math.max(
     viewportPadding + (tooltipRect.width / 2),
     Math.min(window.innerWidth - viewportPadding - (tooltipRect.width / 2), centeredLeft),
   )
+  left.value = clampedLeft
+  arrowLeft.value = Math.max(8, Math.min(tooltipRect.width - 8, (tooltipRect.width / 2) + centeredLeft - clampedLeft))
   const bottomTop = targetRect.bottom + 7
   if (bottomTop + tooltipRect.height <= window.innerHeight - viewportPadding) {
     placement.value = 'bottom'
@@ -106,11 +122,11 @@ function handleViewportChange() {
 }
 
 onMounted(() => {
-  enhanceIconButtons(document.body)
+  enhanceTooltipTargets(document.body)
   observer = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
-      if (mutation.type === 'attributes') enhanceIconButtons(mutation.target)
-      for (const node of mutation.addedNodes) enhanceIconButtons(node)
+      if (mutation.type === 'attributes') enhanceTooltipTargets(mutation.target)
+      for (const node of mutation.addedNodes) enhanceTooltipTargets(node)
     }
   })
   observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['title', 'aria-label'] })
@@ -142,7 +158,7 @@ onBeforeUnmount(() => {
         ref="tooltip"
         class="global-tooltip"
         :class="`global-tooltip-${placement}`"
-        :style="{ left: `${left}px`, top: `${top}px` }"
+        :style="{ left: `${left}px`, top: `${top}px`, '--tooltip-arrow-left': `${arrowLeft}px` }"
         role="tooltip"
       >
         {{ text }}

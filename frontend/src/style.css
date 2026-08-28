@@ -98,7 +98,8 @@ button:disabled {
 .global-tooltip {
   position: fixed;
   z-index: 120;
-  max-width: min(260px, calc(100vw - 16px));
+  width: max-content;
+  max-width: min(320px, calc(100vw - 16px));
   padding: 5px 8px;
   border: 1px solid color-mix(in srgb, var(--app-text) 16%, transparent);
   border-radius: 6px;
@@ -111,12 +112,13 @@ button:disabled {
   pointer-events: none;
   text-align: center;
   transform: translateX(-50%);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .global-tooltip::after {
   position: absolute;
-  left: 50%;
+  left: var(--tooltip-arrow-left, 50%);
   width: 7px;
   height: 7px;
   content: "";

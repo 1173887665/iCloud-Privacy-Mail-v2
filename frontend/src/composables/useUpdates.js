@@ -31,7 +31,7 @@ const unreadAnnouncements = computed(() => {
   const read = new Set(readAnnouncementIDs.value)
   return announcements.value.filter((item) => item?.id && !read.has(item.id))
 })
-const currentVersion = computed(() => updateState.status?.current?.version || '2.0.0')
+const currentVersion = computed(() => updateState.status?.current?.version || '2.1.0')
 const currentCommit = computed(() => updateState.status?.current?.commit || 'unknown')
 
 async function loadUpdates(force = false) {

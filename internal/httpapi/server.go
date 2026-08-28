@@ -123,6 +123,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/mailboxes", s.protected(s.handleMailboxes))
 	s.mux.HandleFunc("POST /api/mailboxes", s.protected(s.handleImportMailbox))
 	s.mux.HandleFunc("POST /api/mailboxes/resolve", s.protected(s.handleMailboxResolve))
+	s.mux.HandleFunc("POST /api/mailboxes/sync-messages", s.protected(s.handleExistingMailboxMessagesSync))
 	s.mux.HandleFunc("POST /api/mailboxes/remote-clean", s.protected(s.handleMailboxesRemoteClean))
 	s.mux.HandleFunc("GET /api/mailboxes/{id}", s.protected(s.handleMailbox))
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/status", s.protected(s.handleMailboxStatus))
@@ -286,6 +287,9 @@ func (s *Server) keepAliveAppleRound(ctx context.Context, baseInterval time.Dura
 		callCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		next, err := keepAliveState(callCtx, state)
 		cancel()
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
 			code, _, _ := protocol.ErrorDetails(err)
 			if code == "apple_account_auth_failed" {
@@ -747,12 +751,25 @@ func (s *Server) handleMailboxStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMailboxSync(w http.ResponseWriter, r *http.Request) {
-	count, err := s.mailbox.SyncMessages(r.Context(), r.PathValue("id"))
+	result, err := s.mailbox.SyncMailboxMessages(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"synced": count}})
+	data := struct {
+		mailboxservice.MailboxMessageSyncBatchResult
+		Synced int `json:"synced"`
+	}{MailboxMessageSyncBatchResult: result, Synced: result.SyncedMessages}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": data})
+}
+
+func (s *Server) handleExistingMailboxMessagesSync(w http.ResponseWriter, r *http.Request) {
+	result, err := s.mailbox.SyncExistingMailboxMessages(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": result})
 }
 
 func (s *Server) handleImportMailbox(w http.ResponseWriter, r *http.Request) {
@@ -978,6 +995,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 			"database_message_retention_days":  s.cfg.DatabaseMessageRetentionDays,
 			"mail_watcher_available":           s.cfg.MailWatcherEnabled,
 			"mail_watcher_poll_ms":             s.cfg.MailWatcherPollMS,
+			"mail_watcher_web_poll_ms":         s.cfg.MailWatcherWebPollMS,
 			"mail_watcher_fetch_limit":         s.cfg.MailWatcherFetchLimit,
 			"mail_watcher_initial_fetch_limit": s.cfg.MailWatcherInitialFetchLimit,
 			"mail_watcher_lookback_hours":      s.cfg.MailWatcherLookbackHours,

@@ -1,0 +1,43 @@
+package httpapi
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+
+	"icloud-privacy-mail-v2/internal/config"
+	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
+	"icloud-privacy-mail-v2/internal/store"
+)
+
+func TestHandleExistingMailboxMessagesSyncReturnsSummary(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建测试数据库失败：%v", err)
+	}
+	defer state.Close()
+
+	server := &Server{mailbox: mailboxservice.NewService(config.Default(), state)}
+	request := httptest.NewRequest(http.MethodPost, "/api/mailboxes/sync-messages", nil)
+	recorder := httptest.NewRecorder()
+	server.handleExistingMailboxMessagesSync(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("同步已有邮箱邮件接口状态不正确：%d，响应=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Success bool `json:"success"`
+		Data    struct {
+			TotalAccounts  int `json:"total_accounts"`
+			TotalMailboxes int `json:"total_mailboxes"`
+			SyncedMessages int `json:"synced_messages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("解析同步接口响应失败：%v", err)
+	}
+	if !payload.Success || payload.Data.TotalAccounts != 0 || payload.Data.TotalMailboxes != 0 || payload.Data.SyncedMessages != 0 {
+		t.Fatalf("空邮箱同步摘要不正确：%+v", payload)
+	}
+}

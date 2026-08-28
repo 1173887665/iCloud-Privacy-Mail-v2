@@ -67,9 +67,10 @@ func runServer(options launchOptions, logger *slog.Logger) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      180 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// 全量邮件同步可能需要遍历多个 Apple 主号和完整收件箱，给长任务保留足够的响应时间。
+		WriteTimeout:   30 * time.Minute,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

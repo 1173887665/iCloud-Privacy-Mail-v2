@@ -3,6 +3,7 @@ package protocol
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseICloudIMAPMessageKeepsHTMLAndPlainText(t *testing.T) {
@@ -35,5 +36,44 @@ func TestParseICloudIMAPMessageKeepsHTMLAndPlainText(t *testing.T) {
 	}
 	if !strings.Contains(recipients, "alias@icloud.com") {
 		t.Fatalf("收件人解析错误：%q", recipients)
+	}
+}
+
+func TestIMAPSearchUsesAccountCursorBeforeMailboxCursor(t *testing.T) {
+	mailboxes := []Mailbox{{ID: "mailbox-1", LastSyncUID: "900"}}
+	command, incremental := imapSearchCommand("42", mailboxes, time.Time{}, true, false)
+	if !incremental || command != "UID SEARCH UID 43:*" {
+		t.Fatalf("账号游标搜索命令不正确：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestIMAPSearchIgnoresLegacyMailboxCursorAfterUIDValidityStateExists(t *testing.T) {
+	mailboxes := []Mailbox{{ID: "mailbox-1", LastSyncUID: "900"}}
+	after := time.Date(2026, 8, 20, 0, 0, 0, 0, time.Local)
+	command, incremental := imapSearchCommand("", mailboxes, after, true, false)
+	if incremental || command != "UID SEARCH SINCE 20-Aug-2026" {
+		t.Fatalf("UIDVALIDITY 重置后不应复用旧邮箱游标：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestIMAPSearchCanMigrateLegacyMailboxCursor(t *testing.T) {
+	mailboxes := []Mailbox{{ID: "mailbox-1", LastSyncUID: "15"}, {ID: "mailbox-2", LastSyncUID: "20"}}
+	command, incremental := imapSearchCommand("", mailboxes, time.Time{}, true, true)
+	if !incremental || command != "UID SEARCH UID 16:*" {
+		t.Fatalf("旧邮箱游标迁移搜索命令不正确：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestIMAPManualSyncSearchesAllBeforeTakingLatestLimit(t *testing.T) {
+	command, incremental := imapSearchCommand("", nil, time.Time{}, false, false)
+	if incremental || command != "UID SEARCH ALL" {
+		t.Fatalf("手动同步应搜索整个收件箱再截取最新邮件：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestIMAPSelectUIDValidity(t *testing.T) {
+	value := imapSelectUIDValidity([]string{"* OK [UIDVALIDITY 3857529045] UIDs valid", "A002 OK SELECT completed"})
+	if value != "3857529045" {
+		t.Fatalf("UIDVALIDITY 解析错误：%q", value)
 	}
 }

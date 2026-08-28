@@ -28,6 +28,8 @@ type Service struct {
 	mailbox         *mailboxservice.Service
 	log             *slog.Logger
 	wake            chan struct{}
+	wakeMu          sync.Mutex
+	wakeAccounts    map[string]bool
 	activeMu        sync.Mutex
 	activeUntil     map[string]time.Time
 	statusMu        sync.RWMutex
@@ -36,15 +38,19 @@ type Service struct {
 	lastPublishedAt time.Time
 }
 
-// Status 是后台监听的真实运行快照，避免仅根据配置开关误报“运行中”。
+// Status 是后台监听的真实运行快照，区分 IMAP IDLE 和 Web API 低频轮询。
 type Status struct {
 	Running              bool      `json:"running"`
 	Enabled              bool      `json:"enabled"`
 	GroupCount           int       `json:"group_count"`
+	IMAPGroupCount       int       `json:"imap_group_count"`
+	WebPollingGroupCount int       `json:"web_polling_group_count"`
 	WorkerCount          int       `json:"worker_count"`
 	ConnectedWorkerCount int       `json:"connected_worker_count"`
 	SyncedMessages       int       `json:"synced_messages"`
 	IdleEvents           int       `json:"idle_events"`
+	WebPolls             int       `json:"web_polls"`
+	WebFallbacks         int       `json:"web_fallbacks"`
 	StartedAt            time.Time `json:"started_at,omitempty"`
 	LastCycleAt          time.Time `json:"last_cycle_at,omitempty"`
 	LastSuccessAt        time.Time `json:"last_success_at,omitempty"`
@@ -61,6 +67,8 @@ type watchGroup struct {
 	session   domain.ICloudSession
 	state     domain.LoginState
 	mailboxes []domain.Mailbox
+	hasIMAP   bool
+	hasWeb    bool
 	signature string
 }
 
@@ -79,6 +87,7 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 		mailbox:      mailbox,
 		log:          logger,
 		wake:         make(chan struct{}, 1),
+		wakeAccounts: make(map[string]bool),
 		activeUntil:  make(map[string]time.Time),
 		readyWorkers: make(map[string]bool),
 	}
@@ -95,16 +104,19 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 }
 
 func (s *Service) Run(ctx context.Context) {
-	interval := time.Duration(s.cfg.MailWatcherPollMS) * time.Millisecond
-	if interval < time.Second {
-		interval = 3 * time.Second
+	reconcileInterval := time.Duration(s.cfg.MailWatcherPollMS) * time.Millisecond
+	if reconcileInterval < time.Second {
+		reconcileInterval = 3 * time.Second
 	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
 	workers := make(map[string]idleWorker)
+	knownGroups := make(map[string]string)
+	webNextAt := make(map[string]time.Time)
+	webFailures := make(map[string]int)
 	defer stopIdleWorkers(workers)
 	defer s.resetReadyWorkers()
-	s.log.Info("后台邮件监听已启动", "轮询间隔", interval)
+	s.log.Info("后台邮件监听已启动", "分组重检间隔", reconcileInterval, "Web 轮询间隔", s.webPollInterval())
 	s.updateStatus(func(status *Status) {
 		status.Running = true
 		status.StartedAt = time.Now()
@@ -115,54 +127,131 @@ func (s *Service) Run(ctx context.Context) {
 		status.ConnectedWorkerCount = 0
 	})
 
-	started := false
-	cycle := func() {
+	enabledLastCycle := false
+	cycle := func(targetAccountID string) {
 		enabled := s.cfg.MailWatcherEnabled && s.store.Settings().EnableMailWatcher
 		groups := s.groups()
+		imapGroups, webPollingGroups := groupModeCounts(groups)
 		s.updateStatus(func(status *Status) {
 			status.Enabled = enabled
 			status.GroupCount = len(groups)
+			status.IMAPGroupCount = imapGroups
+			status.WebPollingGroupCount = webPollingGroups
 			status.LastCycleAt = time.Now()
 		})
 		if !enabled {
-			if started {
+			if enabledLastCycle {
 				stopIdleWorkers(workers)
-				started = false
 			}
+			enabledLastCycle = false
+			clear(knownGroups)
+			clear(webNextAt)
+			clear(webFailures)
 			s.resetReadyWorkers()
 			s.updateStatus(func(status *Status) { status.WorkerCount = 0 })
 			return
 		}
-		initial := !started
-		synced, syncErr := s.syncRound(ctx, groups, initial)
-		s.recordSyncResult(synced, syncErr)
-		if !started {
-			started = true
-		}
+
 		s.ensureIdleWorkers(ctx, workers, groups)
 		s.updateStatus(func(status *Status) { status.WorkerCount = len(workers) })
+
+		now := time.Now()
+		currentGroups := make(map[string]bool, len(groups))
+		initialKeys := make(map[string]bool)
+		for _, group := range groups {
+			currentGroups[group.key] = true
+			if !enabledLastCycle || knownGroups[group.key] != group.signature {
+				initialKeys[group.key] = true
+				knownGroups[group.key] = group.signature
+			}
+		}
+		for key := range knownGroups {
+			if currentGroups[key] {
+				continue
+			}
+			delete(knownGroups, key)
+			delete(webNextAt, key)
+			delete(webFailures, key)
+		}
+		enabledLastCycle = true
+
+		if targetAccountID != "" {
+			if group, found := findWatchGroup(groups, targetAccountID); found {
+				s.syncWatchGroup(ctx, group, false, false)
+				if group.hasWeb {
+					webFailures[group.key] = 0
+					webNextAt[group.key] = now.Add(s.webPollDelay(group.key, 0))
+				}
+			}
+			return
+		}
+
+		for _, group := range groups {
+			if !initialKeys[group.key] {
+				continue
+			}
+			err := s.syncWatchGroup(ctx, group, true, !group.hasIMAP)
+			if group.hasWeb {
+				if err != nil {
+					webFailures[group.key]++
+				} else {
+					webFailures[group.key] = 0
+				}
+				webNextAt[group.key] = now.Add(s.webPollDelay(group.key, webFailures[group.key]))
+			}
+		}
+		for _, group := range groups {
+			shouldWebPoll := group.hasWeb && (!group.hasIMAP || !s.workerReady(group.key))
+			if !shouldWebPoll || initialKeys[group.key] || now.Before(webNextAt[group.key]) {
+				continue
+			}
+			err := s.syncWatchGroup(ctx, group, false, true)
+			if err != nil {
+				webFailures[group.key]++
+			} else {
+				webFailures[group.key] = 0
+			}
+			webNextAt[group.key] = now.Add(s.webPollDelay(group.key, webFailures[group.key]))
+		}
 	}
-	cycle()
+
+	cycle("")
 	for {
 		select {
 		case <-ctx.Done():
 			s.log.Info("后台邮件监听已停止")
 			return
 		case <-s.wake:
-			cycle()
+			accountIDs := s.takeWakeAccounts()
+			if len(accountIDs) == 0 {
+				cycle("")
+				continue
+			}
+			for _, accountID := range accountIDs {
+				cycle(accountID)
+			}
 		case <-ticker.C:
-			cycle()
+			cycle("")
 		}
 	}
 }
 
-// Wake 把主动取码的邮箱提升到本轮同步前面，并立即唤醒监听器。
+// Wake 只唤醒目标邮箱所属 Apple 主账号，不触发其他账号同步。
 func (s *Service) Wake(mailboxID string) {
 	mailboxID = strings.TrimSpace(mailboxID)
+	accountID := ""
 	if mailboxID != "" {
 		s.activeMu.Lock()
 		s.activeUntil[mailboxID] = time.Now().Add(mailWatcherActiveTTL)
 		s.activeMu.Unlock()
+		if mailbox, found := s.store.FindMailboxByID(mailboxID); found {
+			accountID = strings.TrimSpace(mailbox.AccountID)
+		}
+	}
+	if accountID != "" {
+		s.wakeMu.Lock()
+		s.wakeAccounts[accountID] = true
+		s.wakeMu.Unlock()
 	}
 	select {
 	case s.wake <- struct{}{}:
@@ -170,9 +259,21 @@ func (s *Service) Wake(mailboxID string) {
 	}
 }
 
-func (s *Service) syncRound(ctx context.Context, groups []watchGroup, initial bool) (int, error) {
-	if len(groups) == 0 {
-		return 0, nil
+func (s *Service) takeWakeAccounts() []string {
+	s.wakeMu.Lock()
+	defer s.wakeMu.Unlock()
+	accountIDs := make([]string, 0, len(s.wakeAccounts))
+	for accountID := range s.wakeAccounts {
+		accountIDs = append(accountIDs, accountID)
+	}
+	clear(s.wakeAccounts)
+	sort.Strings(accountIDs)
+	return accountIDs
+}
+
+func (s *Service) syncWatchGroup(ctx context.Context, group watchGroup, initial, webPoll bool) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	after := time.Time{}
 	limit := s.cfg.MailWatcherFetchLimit
@@ -182,27 +283,25 @@ func (s *Service) syncRound(ctx context.Context, groups []watchGroup, initial bo
 			after = time.Now().Add(-time.Duration(s.cfg.MailWatcherLookbackHours) * time.Hour)
 		}
 	}
-	total := 0
-	var lastErr error
-	for _, group := range groups {
-		if ctx.Err() != nil {
-			return total, ctx.Err()
-		}
-		syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
-		count, err := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, after, "OpenAI", limit)
-		cancel()
-		total += count
-		if err != nil && ctx.Err() == nil {
-			lastErr = err
-			s.log.Warn("后台批量同步邮箱失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "首次同步", initial, "错误", err)
-		}
+	syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
+	result, err := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
+		Mode: protocol.MailSyncModeVerification, Trigger: "watcher", After: after, Limit: limit,
+		UseCursor: true, AllowFallback: true, UseWebComplement: group.hasIMAP && group.hasWeb,
+	})
+	cancel()
+	s.recordSyncResult(result, err, webPoll)
+	if err != nil && ctx.Err() == nil {
+		s.log.Warn("后台账号级同步邮箱失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "首次同步", initial, "Web 轮询", webPoll, "错误", err)
 	}
-	return total, lastErr
+	return err
 }
 
 func (s *Service) ensureIdleWorkers(ctx context.Context, workers map[string]idleWorker, groups []watchGroup) {
 	seen := make(map[string]bool, len(groups))
 	for _, group := range groups {
+		if !group.hasIMAP {
+			continue
+		}
 		seen[group.key] = true
 		if worker, ok := workers[group.key]; ok && worker.signature == group.signature {
 			continue
@@ -244,9 +343,12 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 				status.LastIdleEventAt = time.Now()
 			})
 			syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
-			count, syncErr := s.mailbox.SyncMailboxBatch(syncCtx, group.mailboxes, time.Time{}, "OpenAI", s.cfg.MailWatcherFetchLimit)
+			result, syncErr := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
+				Mode: protocol.MailSyncModeVerification, Trigger: "imap-idle", Limit: s.cfg.MailWatcherFetchLimit,
+				UseCursor: true, AllowFallback: true, UseWebComplement: group.hasWeb,
+			})
 			cancel()
-			s.recordSyncResult(count, syncErr)
+			s.recordSyncResult(result, syncErr, false)
 			if syncErr != nil && ctx.Err() == nil {
 				s.log.Warn("IMAP IDLE 触发同步失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", syncErr)
 			}
@@ -256,7 +358,6 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 			return
 		}
 		if err == nil {
-			// 收到 EXISTS 后连接会退出当前 IDLE，立即重新建立监听，不进入故障退避。
 			backoff = time.Second
 			continue
 		}
@@ -303,10 +404,14 @@ type statusMaterial struct {
 	Running              bool
 	Enabled              bool
 	GroupCount           int
+	IMAPGroupCount       int
+	WebPollingGroupCount int
 	WorkerCount          int
 	ConnectedWorkerCount int
 	SyncedMessages       int
 	IdleEvents           int
+	WebPolls             int
+	WebFallbacks         int
 	LastError            string
 	LastIdleError        string
 }
@@ -314,17 +419,25 @@ type statusMaterial struct {
 func materialStatus(status Status) statusMaterial {
 	return statusMaterial{
 		Running: status.Running, Enabled: status.Enabled, GroupCount: status.GroupCount,
+		IMAPGroupCount: status.IMAPGroupCount, WebPollingGroupCount: status.WebPollingGroupCount,
 		WorkerCount: status.WorkerCount, ConnectedWorkerCount: status.ConnectedWorkerCount,
 		SyncedMessages: status.SyncedMessages, IdleEvents: status.IdleEvents,
+		WebPolls: status.WebPolls, WebFallbacks: status.WebFallbacks,
 		LastError: status.LastError, LastIdleError: status.LastIdleError,
 	}
 }
 
-func (s *Service) recordSyncResult(count int, err error) {
+func (s *Service) recordSyncResult(result mailboxservice.MailboxMessageSyncBatchResult, err error, webPoll bool) {
 	now := time.Now()
 	s.updateStatus(func(status *Status) {
-		if count > 0 {
-			status.SyncedMessages += count
+		if result.SyncedMessages > 0 {
+			status.SyncedMessages += result.SyncedMessages
+		}
+		if result.Fallbacks > 0 {
+			status.WebFallbacks += result.Fallbacks
+		}
+		if webPoll {
+			status.WebPolls++
 		}
 		if err != nil {
 			status.LastError = err.Error()
@@ -357,6 +470,12 @@ func (s *Service) markWorkerReady(key string, ready bool) {
 	})
 }
 
+func (s *Service) workerReady(key string) bool {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return s.readyWorkers[key]
+}
+
 func (s *Service) resetReadyWorkers() {
 	s.updateStatus(func(status *Status) {
 		s.readyWorkers = make(map[string]bool)
@@ -370,24 +489,39 @@ func (s *Service) groups() []watchGroup {
 		session   domain.ICloudSession
 		state     domain.LoginState
 		mailboxes []domain.Mailbox
+		hasIMAP   bool
+		hasWeb    bool
 	}
 	buckets := make(map[string]*bucket)
+	type sessionEntry struct {
+		session domain.ICloudSession
+		found   bool
+	}
+	sessions := make(map[string]sessionEntry)
 	for _, mailbox := range s.store.AllMailboxes() {
 		if !mailbox.APIActive || !mailbox.ICloudActive || mailbox.Status == domain.StatusDisabled {
 			continue
 		}
-		session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
-		if !ok {
+		accountID := strings.TrimSpace(mailbox.AccountID)
+		entry, cached := sessions[accountID]
+		if !cached {
+			entry.session, entry.found = s.store.ICloudSessionByAccountID(accountID)
+			sessions[accountID] = entry
+		}
+		if !entry.found {
 			continue
 		}
-		imapState, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
-		if !ok || strings.TrimSpace(imapState.IMAPAppPassword) == "" {
+		session := entry.session
+		imapState, imapSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+		hasIMAP := imapSaved && strings.TrimSpace(imapState.IMAPEmail) != "" && strings.TrimSpace(imapState.IMAPAppPassword) != ""
+		hasWeb := protocol.CanUseICloudWebMail(session)
+		if !hasIMAP && !hasWeb {
 			continue
 		}
-		key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__imap__")
+		key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__mail__")
 		item := buckets[key]
 		if item == nil {
-			item = &bucket{session: session, state: imapState}
+			item = &bucket{session: session, state: imapState, hasIMAP: hasIMAP, hasWeb: hasWeb}
 			buckets[key] = item
 		}
 		item.mailboxes = append(item.mailboxes, mailbox)
@@ -409,11 +543,9 @@ func (s *Service) groups() []watchGroup {
 			return item.mailboxes[i].Email < item.mailboxes[j].Email
 		})
 		groups = append(groups, watchGroup{
-			key:       key,
-			session:   item.session,
-			state:     item.state,
-			mailboxes: item.mailboxes,
-			signature: groupSignature(item.state, item.mailboxes),
+			key: key, session: item.session, state: item.state, mailboxes: item.mailboxes,
+			hasIMAP: item.hasIMAP, hasWeb: item.hasWeb,
+			signature: groupSignature(item.session, item.state, item.mailboxes),
 		})
 	}
 	return groups
@@ -433,12 +565,60 @@ func (s *Service) activeMailboxIDs(now time.Time) map[string]bool {
 	return active
 }
 
-func groupSignature(state domain.LoginState, mailboxes []domain.Mailbox) string {
-	parts := []string{state.IMAPEmail, state.IMAPUsername, state.IMAPHost, fmt.Sprint(state.IMAPPort), state.IMAPAppPassword}
+func groupSignature(session domain.ICloudSession, state domain.LoginState, mailboxes []domain.Mailbox) string {
+	parts := []string{
+		session.AccountID, session.DSID, session.MailGatewayBaseURL, session.MailBaseURL, session.PremiumMailBaseURL,
+		state.IMAPEmail, state.IMAPUsername, state.IMAPHost, fmt.Sprint(state.IMAPPort), state.IMAPAppPassword,
+	}
+	for _, cookie := range session.Cookies {
+		parts = append(parts, cookie.Name, cookie.Value, cookie.Domain, cookie.Path, fmt.Sprint(cookie.Expires))
+	}
 	for _, mailbox := range mailboxes {
 		parts = append(parts, mailbox.ID, mailbox.Email)
 	}
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(parts, "|"))))
+}
+
+func groupModeCounts(groups []watchGroup) (imap, webPolling int) {
+	for _, group := range groups {
+		if group.hasIMAP {
+			imap++
+		} else if group.hasWeb {
+			webPolling++
+		}
+	}
+	return imap, webPolling
+}
+
+func findWatchGroup(groups []watchGroup, accountID string) (watchGroup, bool) {
+	accountID = strings.TrimSpace(accountID)
+	for _, group := range groups {
+		if group.key == accountID || strings.TrimSpace(group.session.AccountID) == accountID {
+			return group, true
+		}
+	}
+	return watchGroup{}, false
+}
+
+func (s *Service) webPollInterval() time.Duration {
+	interval := time.Duration(s.cfg.MailWatcherWebPollMS) * time.Millisecond
+	if interval < 15*time.Second {
+		return time.Minute
+	}
+	return interval
+}
+
+func (s *Service) webPollDelay(key string, failures int) time.Duration {
+	delay := s.webPollInterval()
+	for attempt := 0; attempt < failures && delay < 15*time.Minute; attempt++ {
+		delay *= 2
+	}
+	if delay > 15*time.Minute {
+		delay = 15 * time.Minute
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(key)))
+	jitter := time.Duration(int(sum[0])%21) * delay / 100
+	return delay + jitter
 }
 
 func stopIdleWorkers(workers map[string]idleWorker) {

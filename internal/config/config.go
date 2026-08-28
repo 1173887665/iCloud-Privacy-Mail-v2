@@ -24,6 +24,7 @@ type Config struct {
 	AppleAccountKeepAliveJitterPercent int    `json:"apple_account_keep_alive_jitter_percent"`
 	MailWatcherEnabled                 bool   `json:"mail_watcher_enabled"`
 	MailWatcherPollMS                  int    `json:"mail_watcher_poll_ms"`
+	MailWatcherWebPollMS               int    `json:"mail_watcher_web_poll_ms"`
 	MailWatcherFetchLimit              int    `json:"mail_watcher_fetch_limit"`
 	MailWatcherInitialFetchLimit       int    `json:"mail_watcher_initial_fetch_limit"`
 	MailWatcherLookbackHours           int    `json:"mail_watcher_lookback_hours"`
@@ -58,6 +59,7 @@ func Default() Config {
 		AppleAccountKeepAliveJitterPercent: 15,
 		MailWatcherEnabled:                 true,
 		MailWatcherPollMS:                  3000,
+		MailWatcherWebPollMS:               60000,
 		MailWatcherFetchLimit:              8,
 		MailWatcherInitialFetchLimit:       20,
 		MailWatcherLookbackHours:           24,
@@ -134,6 +136,9 @@ func Load(path string) (Config, error) {
 	}
 	if incoming.MailWatcherPollMS > 0 {
 		cfg.MailWatcherPollMS = incoming.MailWatcherPollMS
+	}
+	if incoming.MailWatcherWebPollMS > 0 {
+		cfg.MailWatcherWebPollMS = incoming.MailWatcherWebPollMS
 	}
 	if incoming.MailWatcherFetchLimit > 0 {
 		cfg.MailWatcherFetchLimit = incoming.MailWatcherFetchLimit

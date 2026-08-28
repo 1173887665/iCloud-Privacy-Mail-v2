@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 const (
 	StatusActive    = "active"
@@ -89,6 +89,7 @@ type Mailbox struct {
 	RemoteOrigin      string    `json:"remote_origin,omitempty"`
 	Label             string    `json:"label"`
 	Email             string    `json:"email"`
+	ForwardToEmail    string    `json:"forward_to_email,omitempty"`
 	APIToken          string    `json:"api_token,omitempty"`
 	APIActive         bool      `json:"api_active"`
 	ICloudActive      bool      `json:"icloud_active"`
@@ -127,6 +128,8 @@ type Message struct {
 	OwnerID     string    `json:"owner_id,omitempty"`
 	MailboxID   string    `json:"mailbox_id"`
 	RemoteID    string    `json:"remote_id,omitempty"`
+	RemoteIDs   []string  `json:"remote_ids,omitempty"`
+	CanonicalID string    `json:"canonical_id,omitempty"`
 	Source      string    `json:"source,omitempty"`
 	Subject     string    `json:"subject"`
 	From        string    `json:"from"`
@@ -138,12 +141,13 @@ type Message struct {
 }
 
 type RemoteMailbox struct {
-	AnonymousID string `json:"anonymous_id,omitempty"`
-	Email       string `json:"email"`
-	Label       string `json:"label,omitempty"`
-	Note        string `json:"note,omitempty"`
-	IsActive    bool   `json:"is_active"`
-	Origin      string `json:"origin,omitempty"`
+	AnonymousID    string `json:"anonymous_id,omitempty"`
+	Email          string `json:"email"`
+	ForwardToEmail string `json:"forward_to_email,omitempty"`
+	Label          string `json:"label,omitempty"`
+	Note           string `json:"note,omitempty"`
+	IsActive       bool   `json:"is_active"`
+	Origin         string `json:"origin,omitempty"`
 }
 
 type Event struct {
@@ -226,6 +230,7 @@ type LoginState struct {
 	IMAPAppPassword   string          `json:"imap_app_password,omitempty"`
 	IMAPLastSyncAt    time.Time       `json:"imap_last_sync_at,omitempty"`
 	IMAPLastSyncUID   string          `json:"imap_last_sync_uid,omitempty"`
+	IMAPUIDValidity   string          `json:"imap_uid_validity,omitempty"`
 	ManageExpiresAt   time.Time       `json:"manage_expires_at,omitempty"`
 	LastCheckedAt     time.Time       `json:"last_checked_at,omitempty"`
 	LastCheckOK       bool            `json:"last_check_ok,omitempty"`

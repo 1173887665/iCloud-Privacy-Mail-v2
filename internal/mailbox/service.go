@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type Service struct {
 	cfg               config.Config
 	store             *store.Store
 	client            *protocol.ICloudClient
+	messageBackend    messageSyncBackend
 	deleteClient      remoteMailboxDeleteClient
 	createMu          sync.Mutex
 	syncMu            sync.Mutex
@@ -40,9 +42,27 @@ type remoteMailboxDeleteClient interface {
 const mailboxCodeFreshWindow = 5 * time.Minute
 
 type syncCall struct {
-	done  chan struct{}
-	count int
-	err   error
+	done      chan struct{}
+	signature string
+	result    AccountMessageSyncResult
+	err       error
+}
+
+type messageSyncBackend interface {
+	SyncIMAP(context.Context, protocol.LoginState, []domain.Mailbox, protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error)
+	SyncWeb(context.Context, protocol.ICloudSession, []domain.Mailbox, protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error)
+}
+
+type defaultMessageSyncBackend struct {
+	client *protocol.ICloudClient
+}
+
+func (backend defaultMessageSyncBackend) SyncIMAP(ctx context.Context, state protocol.LoginState, mailboxes []domain.Mailbox, options protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error) {
+	return protocol.SyncICloudIMAPMessagesWithOptions(ctx, state, mailboxes, options)
+}
+
+func (backend defaultMessageSyncBackend) SyncWeb(ctx context.Context, session protocol.ICloudSession, mailboxes []domain.Mailbox, options protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error) {
+	return backend.client.SyncMailboxMessagesBatchWithOptions(ctx, session, mailboxes, options)
 }
 
 type CodeResult struct {
@@ -58,6 +78,76 @@ type MessageContentBackfillResult struct {
 	Total   int
 	Updated int
 	Failed  int
+}
+
+type ExistingMailboxMessageSyncFailure struct {
+	AccountID string `json:"account_id"`
+	Account   string `json:"account"`
+	Mailboxes int    `json:"mailboxes"`
+	Error     string `json:"error"`
+}
+
+type MessageSyncOptions struct {
+	Mode             protocol.MailSyncMode
+	Trigger          string
+	After            time.Time
+	Limit            int
+	FullScan         bool
+	UseCursor        bool
+	AllowFallback    bool
+	UseWebComplement bool
+}
+
+type AccountMessageSyncResult struct {
+	AccountID         string `json:"account_id"`
+	Account           string `json:"account"`
+	Mailboxes         int    `json:"mailboxes"`
+	Method            string `json:"method,omitempty"`
+	FallbackUsed      bool   `json:"fallback_used"`
+	FallbackReason    string `json:"fallback_reason,omitempty"`
+	Scanned           int    `json:"scanned"`
+	Matched           int    `json:"matched"`
+	SyncedMessages    int    `json:"synced_messages"`
+	HasMore           bool   `json:"has_more"`
+	InitializedCursor bool   `json:"initialized_cursor"`
+	Error             string `json:"error,omitempty"`
+}
+
+type MailboxMessageSyncBatchResult struct {
+	Accounts       []AccountMessageSyncResult `json:"accounts,omitempty"`
+	SyncedMessages int                        `json:"synced_messages"`
+	Scanned        int                        `json:"scanned"`
+	Matched        int                        `json:"matched"`
+	IMAPAccounts   int                        `json:"imap_accounts"`
+	WebAPIAccounts int                        `json:"web_api_accounts"`
+	Fallbacks      int                        `json:"fallbacks"`
+	HasMore        bool                       `json:"has_more"`
+}
+
+type MailSyncState struct {
+	AccountID      string    `json:"account_id"`
+	Method         string    `json:"method"`
+	Folder         string    `json:"folder"`
+	UIDValidity    string    `json:"uid_validity,omitempty"`
+	LastScannedUID string    `json:"last_scanned_uid,omitempty"`
+	LastSyncAt     time.Time `json:"last_sync_at,omitempty"`
+}
+
+type ExistingMailboxMessageSyncResult struct {
+	TotalAccounts      int                                 `json:"total_accounts"`
+	TotalMailboxes     int                                 `json:"total_mailboxes"`
+	SkippedMailboxes   int                                 `json:"skipped_mailboxes"`
+	SuccessfulAccounts int                                 `json:"successful_accounts"`
+	FailedAccounts     int                                 `json:"failed_accounts"`
+	SyncedMessages     int                                 `json:"synced_messages"`
+	Scanned            int                                 `json:"scanned"`
+	Matched            int                                 `json:"matched"`
+	IMAPAccounts       int                                 `json:"imap_accounts"`
+	WebAPIAccounts     int                                 `json:"web_api_accounts"`
+	Fallbacks          int                                 `json:"fallbacks"`
+	HasMore            bool                                `json:"has_more"`
+	Accounts           []AccountMessageSyncResult          `json:"accounts,omitempty"`
+	Failures           []ExistingMailboxMessageSyncFailure `json:"failures,omitempty"`
 }
 
 type CodeQuery struct {
@@ -136,7 +226,7 @@ const appleMailCleanupStateID = "apple-mail-cleanup"
 
 func NewService(cfg config.Config, state *store.Store) *Service {
 	client := protocol.NewICloudClient()
-	service := &Service{cfg: cfg, store: state, client: client, deleteClient: client, syncs: make(map[string]*syncCall), cleanupState: AppleMailCleanupJob{Status: "idle"}, cleanupMailboxes: make(map[string]int)}
+	service := &Service{cfg: cfg, store: state, client: client, messageBackend: defaultMessageSyncBackend{client: client}, deleteClient: client, syncs: make(map[string]*syncCall), cleanupState: AppleMailCleanupJob{Status: "idle"}, cleanupMailboxes: make(map[string]int)}
 	if state != nil {
 		var persisted AppleMailCleanupJob
 		if found, err := state.LoadRuntimeState(appleMailCleanupStateID, &persisted); err == nil && found {
@@ -718,9 +808,25 @@ func (s *Service) appleMailCleanupSnapshotLocked() AppleMailCleanupJob {
 }
 
 func (s *Service) SyncMessages(ctx context.Context, mailboxID string) (int, error) {
+	result, err := s.syncMailboxMessagesWithOptions(ctx, mailboxID, MessageSyncOptions{
+		Mode: protocol.MailSyncModeVerification, Trigger: "verification", Limit: s.cfg.MailWatcherFetchLimit,
+		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+	})
+	return result.SyncedMessages, err
+}
+
+// SyncMailboxMessages 同步指定邮箱所属 Apple 主号的新邮件，并把结果分发到该主号的全部隐私邮箱。
+func (s *Service) SyncMailboxMessages(ctx context.Context, mailboxID string) (MailboxMessageSyncBatchResult, error) {
+	return s.syncMailboxMessagesWithOptions(ctx, mailboxID, MessageSyncOptions{
+		Mode: protocol.MailSyncModeAllRecent, Trigger: "manual", Limit: s.cfg.MailWatcherFetchLimit,
+		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+	})
+}
+
+func (s *Service) syncMailboxMessagesWithOptions(ctx context.Context, mailboxID string, options MessageSyncOptions) (MailboxMessageSyncBatchResult, error) {
 	mailbox, ok := s.store.FindMailboxByID(mailboxID)
 	if !ok {
-		return 0, errors.New("邮箱不存在")
+		return MailboxMessageSyncBatchResult{}, errors.New("邮箱不存在")
 	}
 	mailboxes := s.mailboxesForAccount(mailbox.AccountID)
 	found := false
@@ -733,16 +839,119 @@ func (s *Service) SyncMessages(ctx context.Context, mailboxID string) (int, erro
 	if !found {
 		mailboxes = append(mailboxes, mailbox)
 	}
-	return s.SyncMailboxBatch(ctx, mailboxes, time.Time{}, "", s.cfg.MailWatcherFetchLimit)
+	return s.SyncMailboxBatchWithOptions(ctx, mailboxes, options)
+}
+
+// SyncExistingMailboxMessages 每个 Apple 主账号只拉取一次收件箱，再在本地把邮件分发到对应隐私邮箱。
+func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMailboxMessageSyncResult, error) {
+	allMailboxes := s.store.AllMailboxes()
+	result := ExistingMailboxMessageSyncResult{}
+	groups := make(map[string][]domain.Mailbox)
+	order := make([]string, 0)
+	for _, mailbox := range allMailboxes {
+		accountID := strings.TrimSpace(mailbox.AccountID)
+		if accountID == "" || strings.TrimSpace(mailbox.Email) == "" {
+			result.SkippedMailboxes++
+			continue
+		}
+		if _, exists := groups[accountID]; !exists {
+			order = append(order, accountID)
+		}
+		groups[accountID] = append(groups[accountID], mailbox)
+		result.TotalMailboxes++
+	}
+	result.TotalAccounts = len(order)
+	type syncJob struct {
+		index     int
+		accountID string
+		mailboxes []domain.Mailbox
+	}
+	accountResults := make([]AccountMessageSyncResult, len(order))
+	jobs := make(chan syncJob)
+	workerCount := 3
+	if len(order) < workerCount {
+		workerCount = len(order)
+	}
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				accountResult, syncErr := s.syncGroup(ctx, job.accountID, job.mailboxes, MessageSyncOptions{
+					Mode: protocol.MailSyncModeAllRecent, Trigger: "bulk-manual",
+					FullScan: true, UseCursor: false, AllowFallback: true, UseWebComplement: true,
+				})
+				if syncErr != nil {
+					accountResult.Error = syncErr.Error()
+				}
+				accountResults[job.index] = accountResult
+			}
+		}()
+	}
+	for index, accountID := range order {
+		if ctx.Err() != nil {
+			break
+		}
+		jobs <- syncJob{index: index, accountID: accountID, mailboxes: groups[accountID]}
+	}
+	close(jobs)
+	workers.Wait()
+	for _, accountResult := range accountResults {
+		if accountResult.AccountID == "" {
+			continue
+		}
+		result.Accounts = append(result.Accounts, accountResult)
+		result.SyncedMessages += accountResult.SyncedMessages
+		result.Scanned += accountResult.Scanned
+		result.Matched += accountResult.Matched
+		result.HasMore = result.HasMore || accountResult.HasMore
+		if accountResult.FallbackUsed {
+			result.Fallbacks++
+		}
+		switch accountResult.Method {
+		case "imap":
+			result.IMAPAccounts++
+		case "web_api":
+			result.WebAPIAccounts++
+		case "imap_web":
+			result.IMAPAccounts++
+			result.WebAPIAccounts++
+		}
+		if accountResult.Error == "" {
+			result.SuccessfulAccounts++
+			continue
+		}
+		result.FailedAccounts++
+		result.Failures = append(result.Failures, ExistingMailboxMessageSyncFailure{
+			AccountID: accountResult.AccountID, Account: accountResult.Account, Mailboxes: accountResult.Mailboxes, Error: accountResult.Error,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 // SyncMailboxBatch 按 Apple 账号批量拉取一次收件箱，再把邮件分发给对应隐私邮箱。
 func (s *Service) SyncMailboxBatch(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
+	result, err := s.SyncMailboxBatchWithOptions(ctx, mailboxes, MessageSyncOptions{
+		Mode: protocol.MailSyncModeVerification, Trigger: "watcher", After: after, Limit: maxMessages,
+		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+	})
+	return result.SyncedMessages, err
+}
+
+func (s *Service) SyncMailboxBatchWithOptions(ctx context.Context, mailboxes []domain.Mailbox, options MessageSyncOptions) (MailboxMessageSyncBatchResult, error) {
+	var result MailboxMessageSyncBatchResult
 	if len(mailboxes) == 0 {
-		return 0, nil
+		return result, nil
 	}
-	if maxMessages <= 0 {
-		maxMessages = s.cfg.MailWatcherFetchLimit
+	if options.Limit <= 0 && !options.FullScan {
+		options.Limit = s.cfg.MailWatcherFetchLimit
+	}
+	if options.Mode == "" {
+		options.Mode = protocol.MailSyncModeVerification
 	}
 	groups := make(map[string][]domain.Mailbox)
 	order := make([]string, 0)
@@ -753,41 +962,60 @@ func (s *Service) SyncMailboxBatch(ctx context.Context, mailboxes []domain.Mailb
 		}
 		groups[key] = append(groups[key], mailbox)
 	}
-	total := 0
 	for _, key := range order {
-		count, err := s.syncGroup(ctx, key, groups[key], after, keyword, maxMessages)
-		total += count
+		accountResult, err := s.syncGroup(ctx, key, groups[key], options)
+		result.Accounts = append(result.Accounts, accountResult)
+		result.SyncedMessages += accountResult.SyncedMessages
+		result.Scanned += accountResult.Scanned
+		result.Matched += accountResult.Matched
+		result.HasMore = result.HasMore || accountResult.HasMore
+		if accountResult.FallbackUsed {
+			result.Fallbacks++
+		}
+		switch accountResult.Method {
+		case "imap":
+			result.IMAPAccounts++
+		case "web_api":
+			result.WebAPIAccounts++
+		case "imap_web":
+			result.IMAPAccounts++
+			result.WebAPIAccounts++
+		}
 		if err != nil {
-			return total, err
+			return result, err
 		}
 	}
-	return total, nil
+	return result, nil
 }
 
-func (s *Service) syncGroup(ctx context.Context, key string, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
+func (s *Service) syncGroup(ctx context.Context, key string, mailboxes []domain.Mailbox, options MessageSyncOptions) (AccountMessageSyncResult, error) {
+	signature := messageSyncRequestSignature(mailboxes, options)
 	s.syncMu.Lock()
 	if running := s.syncs[key]; running != nil {
 		s.syncMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return AccountMessageSyncResult{}, ctx.Err()
 		case <-running.done:
-			return running.count, running.err
+			if running.signature == signature {
+				return running.result, running.err
+			}
+			return s.syncGroup(ctx, key, mailboxes, options)
 		}
 	}
-	call := &syncCall{done: make(chan struct{})}
+	call := &syncCall{done: make(chan struct{}), signature: signature}
 	s.syncs[key] = call
 	s.syncMu.Unlock()
 
-	call.count, call.err = s.syncGroupNow(ctx, mailboxes, after, keyword, maxMessages)
+	call.result, call.err = s.syncGroupNow(ctx, mailboxes, options)
 	s.syncMu.Lock()
 	delete(s.syncs, key)
 	close(call.done)
 	s.syncMu.Unlock()
-	return call.count, call.err
+	return call.result, call.err
 }
 
-func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
+func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, options MessageSyncOptions) (AccountMessageSyncResult, error) {
 	refreshed := make([]domain.Mailbox, 0, len(mailboxes))
 	for _, mailbox := range mailboxes {
 		if current, ok := s.store.FindMailboxByID(mailbox.ID); ok {
@@ -795,55 +1023,204 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 		}
 	}
 	if len(refreshed) == 0 {
-		return 0, nil
+		return AccountMessageSyncResult{}, nil
 	}
-	session, ok := s.store.ICloudSessionByAccountID(refreshed[0].AccountID)
+	accountID := strings.TrimSpace(refreshed[0].AccountID)
+	accountName := accountID
+	if account, found := s.store.FindAppleAccount(accountID); found {
+		accountName = firstNonEmpty(account.Label, account.AppleID, accountID)
+	}
+	accountResult := AccountMessageSyncResult{AccountID: accountID, Account: accountName, Mailboxes: len(refreshed)}
+	session, ok := s.store.ICloudSessionByAccountID(accountID)
 	if !ok {
-		return 0, errors.New("对应 Apple 账号登录态不存在")
+		return accountResult, errors.New("对应 Apple 账号登录态不存在")
 	}
-
-	messagesByMailbox := make(map[string][]protocol.ICloudSyncedMessage)
-	lastUID := ""
+	backend := s.messageBackend
+	if backend == nil {
+		backend = defaultMessageSyncBackend{client: s.client}
+	}
+	protocolOptions := protocol.MailSyncOptions{Mode: options.Mode, After: options.After, Limit: options.Limit, FullScan: options.FullScan, UseCursor: options.UseCursor}
+	var syncResult protocol.MailSyncBatchResult
+	var syncErr error
+	var imapErr error
+	var complementErr error
 	source := "icloud"
-	if imapState, saved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP); saved {
-		result, err := protocol.SyncICloudIMAPMessagesDetailed(ctx, imapState, refreshed, after, keyword, maxMessages)
-		if err != nil {
-			return 0, err
+	imapState, imapSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
+	imapConfigured := imapSaved && strings.TrimSpace(imapState.IMAPEmail) != "" && strings.TrimSpace(imapState.IMAPAppPassword) != ""
+	if imapConfigured {
+		var cursor MailSyncState
+		if found, _ := s.store.LoadRuntimeState(mailSyncStateID(accountID, "imap"), &cursor); found {
+			protocolOptions.CursorUID = cursor.LastScannedUID
+			protocolOptions.CursorUIDValidity = cursor.UIDValidity
+		} else {
+			protocolOptions.CursorUID = imapState.IMAPLastSyncUID
+			protocolOptions.CursorUIDValidity = imapState.IMAPUIDValidity
 		}
-		messagesByMailbox = result.MessagesByMailbox
-		lastUID = strings.TrimSpace(result.LastUID)
-		source = "imap"
-		if lastUID != "" && (lastUID != strings.TrimSpace(imapState.IMAPLastSyncUID) || imapState.IMAPLastSyncAt.IsZero() || time.Since(imapState.IMAPLastSyncAt) >= time.Minute) {
-			imapState.IMAPLastSyncAt = time.Now()
-			imapState.IMAPLastSyncUID = lastUID
-			session = protocol.WithLoginState(session, imapState)
-			if _, err := s.store.SaveICloudSession(session); err != nil {
-				return 0, err
+		syncResult, imapErr = backend.SyncIMAP(ctx, imapState, refreshed, protocolOptions)
+		if imapErr == nil {
+			accountResult.Method = "imap"
+			source = "imap"
+		}
+	}
+	if accountResult.Method == "imap" && options.UseWebComplement && protocol.CanUseICloudWebMail(session) {
+		webResult, webErr := backend.SyncWeb(ctx, session, refreshed, protocolOptions)
+		if webErr == nil {
+			syncResult = mergeMailSyncBatchResults(syncResult, webResult)
+			accountResult.Method = "imap_web"
+			source = ""
+		} else {
+			accountResult.FallbackReason = "IMAP 已完成，但 iCloud Web 补查失败：" + webErr.Error()
+			if options.FullScan || options.Trigger == "manual" {
+				complementErr = errors.New(accountResult.FallbackReason)
 			}
 		}
-	} else {
-		var err error
-		messagesByMailbox, err = s.client.SyncMailboxMessagesBatch(ctx, session, refreshed, after, keyword, maxMessages)
-		if err != nil {
-			return 0, err
+	}
+	if accountResult.Method == "" {
+		if ctx.Err() != nil {
+			return accountResult, ctx.Err()
+		}
+		if imapErr != nil && !options.AllowFallback {
+			return accountResult, imapErr
+		}
+		if !protocol.CanUseICloudWebMail(session) {
+			switch {
+			case imapErr != nil:
+				return accountResult, fmt.Errorf("IMAP 读信失败，且 iCloud Web 邮件登录态不可用：%w", imapErr)
+			case imapConfigured:
+				return accountResult, errors.New("iCloud Web 邮件登录态不可用")
+			default:
+				return accountResult, errors.New("没有可用的读信方式，请配置主号 IMAP 或重新登录 iCloud Web")
+			}
+		}
+		syncResult, syncErr = backend.SyncWeb(ctx, session, refreshed, protocolOptions)
+		if syncErr != nil {
+			if imapErr != nil {
+				return accountResult, fmt.Errorf("IMAP 读信失败：%v；iCloud Web 回退也失败：%w", imapErr, syncErr)
+			}
+			return accountResult, syncErr
+		}
+		accountResult.Method = "web_api"
+		if imapErr != nil {
+			accountResult.FallbackUsed = true
+			accountResult.FallbackReason = imapErr.Error()
 		}
 	}
 
 	syncedAt := time.Now()
 	updates := make([]store.MailboxSyncUpdate, 0, len(refreshed))
 	for _, mailbox := range refreshed {
-		mailboxUID := firstNonEmpty(lastUID, mailbox.LastSyncUID)
-		update := store.MailboxSyncUpdate{MailboxID: mailbox.ID, LastUID: mailboxUID, SyncedAt: syncedAt}
-		for _, message := range messagesByMailbox[mailbox.ID] {
+		update := store.MailboxSyncUpdate{MailboxID: mailbox.ID, SyncedAt: syncedAt}
+		for _, message := range syncResult.MessagesByMailbox[mailbox.ID] {
 			remoteID := firstNonEmpty(message.RemoteID, message.UID)
 			update.Messages = append(update.Messages, store.MailboxSyncMessage{
-				RemoteID: remoteID, Source: source, Subject: message.Subject, From: message.From,
+				RemoteID: remoteID, RemoteIDs: message.RemoteIDs, CanonicalID: message.CanonicalID, Source: firstNonEmpty(message.Source, source), Subject: message.Subject, From: message.From,
 				Body: message.Body, HTMLBody: message.HTMLBody, ContentType: message.ContentType, ReceivedAt: message.ReceivedAt,
 			})
 		}
 		updates = append(updates, update)
 	}
-	return s.store.ApplyMailboxSyncBatch(updates)
+	var created int
+	if strings.HasPrefix(accountResult.Method, "imap") && options.UseCursor {
+		state := MailSyncState{AccountID: accountID, Method: "imap", Folder: "INBOX", UIDValidity: syncResult.UIDValidity, LastScannedUID: syncResult.LastUID, LastSyncAt: syncedAt}
+		created, syncErr = s.store.ApplyMailboxSyncBatchWithRuntimeState(updates, mailSyncStateID(accountID, "imap"), state)
+	} else {
+		created, syncErr = s.store.ApplyMailboxSyncBatch(updates)
+	}
+	if syncErr != nil {
+		return accountResult, syncErr
+	}
+	accountResult.Scanned = syncResult.Scanned
+	accountResult.Matched = syncResult.Matched
+	accountResult.SyncedMessages = created
+	accountResult.HasMore = syncResult.HasMore
+	accountResult.InitializedCursor = syncResult.InitializedCursor
+	return accountResult, complementErr
+}
+
+func mergeMailSyncBatchResults(primary, complement protocol.MailSyncBatchResult) protocol.MailSyncBatchResult {
+	if primary.MessagesByMailbox == nil {
+		primary.MessagesByMailbox = make(map[string][]protocol.ICloudSyncedMessage)
+	}
+	for mailboxID, messages := range complement.MessagesByMailbox {
+		merged := primary.MessagesByMailbox[mailboxID]
+		byKey := make(map[string]int, len(merged))
+		for index, message := range merged {
+			if key := syncedMessageKey(message); key != "" {
+				byKey[key] = index
+			}
+		}
+		for _, message := range messages {
+			key := syncedMessageKey(message)
+			index, found := byKey[key]
+			if key == "" || !found {
+				merged = append(merged, message)
+				if key != "" {
+					byKey[key] = len(merged) - 1
+				}
+				continue
+			}
+			existing := &merged[index]
+			existing.RemoteIDs = mergeRemoteIDs(existing.RemoteIDs, message.RemoteIDs, []string{existing.RemoteID, message.RemoteID})
+			if existing.CanonicalID == "" {
+				existing.CanonicalID = message.CanonicalID
+			}
+			if strings.TrimSpace(existing.HTMLBody) == "" && strings.TrimSpace(message.HTMLBody) != "" {
+				existing.HTMLBody = message.HTMLBody
+				existing.ContentType = message.ContentType
+			}
+			if len(strings.TrimSpace(message.Body)) > len(strings.TrimSpace(existing.Body)) {
+				existing.Body = message.Body
+			}
+		}
+		primary.MessagesByMailbox[mailboxID] = merged
+	}
+	primary.Scanned += complement.Scanned
+	primary.Matched = 0
+	for _, messages := range primary.MessagesByMailbox {
+		primary.Matched += len(messages)
+	}
+	primary.HasMore = primary.HasMore || complement.HasMore
+	return primary
+}
+
+func syncedMessageKey(message protocol.ICloudSyncedMessage) string {
+	if canonicalID := strings.TrimSpace(message.CanonicalID); canonicalID != "" {
+		return "canonical:" + canonicalID
+	}
+	if remoteID := strings.TrimSpace(message.RemoteID); remoteID != "" {
+		return "remote:" + remoteID
+	}
+	return ""
+}
+
+func mergeRemoteIDs(groups ...[]string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, values := range groups {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func mailSyncStateID(accountID, method string) string {
+	return "mail-sync:" + strings.TrimSpace(accountID) + ":" + strings.TrimSpace(method) + ":inbox"
+}
+
+func messageSyncRequestSignature(mailboxes []domain.Mailbox, options MessageSyncOptions) string {
+	parts := []string{string(options.Mode), options.Trigger, options.After.UTC().Format(time.RFC3339Nano), fmt.Sprint(options.Limit), fmt.Sprint(options.FullScan), fmt.Sprint(options.UseCursor), fmt.Sprint(options.AllowFallback), fmt.Sprint(options.UseWebComplement)}
+	ids := make([]string, 0, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		ids = append(ids, mailbox.ID)
+	}
+	sort.Strings(ids)
+	return strings.Join(append(parts, ids...), "|")
 }
 
 // MessageContent 返回本地完整邮件；旧 IMAP 缓存缺少 HTML 时会按 UID 自动补全。
@@ -859,11 +1236,8 @@ func (s *Service) MessageContent(ctx context.Context, mailboxID, messageID strin
 	if strings.TrimSpace(message.HTMLBody) != "" || strings.TrimSpace(message.ContentType) != "" {
 		return message, nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(message.Source), "imap") {
-		return message, nil
-	}
-	uid := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(message.RemoteID), "imap:"))
-	if uid == "" || uid == message.RemoteID {
+	uid := imapUIDForMessage(message)
+	if uid == "" {
 		return message, nil
 	}
 	session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
@@ -926,8 +1300,8 @@ func (s *Service) BackfillMessageContent(ctx context.Context) (MessageContentBac
 		uidTargets := make(map[string][]target)
 		uidOrder := make([]string, 0)
 		for _, item := range groups[accountID] {
-			uid := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(item.message.RemoteID), "imap:"))
-			if uid == "" || uid == item.message.RemoteID {
+			uid := imapUIDForMessage(item.message)
+			if uid == "" {
 				continue
 			}
 			if _, exists := uidTargets[uid]; !exists {
@@ -964,6 +1338,20 @@ func (s *Service) BackfillMessageContent(ctx context.Context) (MessageContentBac
 		return result, errors.New(strings.Join(failures, "；"))
 	}
 	return result, nil
+}
+
+func imapUIDForMessage(message domain.Message) string {
+	ids := append(append([]string(nil), message.RemoteIDs...), message.RemoteID)
+	for _, remoteID := range ids {
+		remoteID = strings.TrimSpace(remoteID)
+		if !strings.HasPrefix(strings.ToLower(remoteID), "imap:") {
+			continue
+		}
+		if uid := strings.TrimSpace(remoteID[len("imap:"):]); uid != "" {
+			return uid
+		}
+	}
+	return ""
 }
 
 func (s *Service) Code(ctx context.Context, mailboxID string, after time.Time, keyword string, allowStale bool) (CodeResult, error) {
@@ -1087,18 +1475,21 @@ func remoteMessageIDs(messages []domain.Message) []string {
 	out := make([]string, 0, len(messages))
 	seen := make(map[string]bool)
 	for _, message := range messages {
-		remoteID := strings.TrimSpace(message.RemoteID)
-		if remoteID == "" || seen[remoteID] {
-			continue
+		ids := append(append([]string(nil), message.RemoteIDs...), message.RemoteID)
+		for _, remoteID := range ids {
+			remoteID = strings.TrimSpace(remoteID)
+			if remoteID == "" || seen[remoteID] {
+				continue
+			}
+			seen[remoteID] = true
+			out = append(out, remoteID)
 		}
-		seen[remoteID] = true
-		out = append(out, remoteID)
 	}
 	return out
 }
 
 func remoteMailbox(remote protocol.ICloudRemoteMailbox) domain.RemoteMailbox {
-	return domain.RemoteMailbox{AnonymousID: remote.AnonymousID, Email: remote.Email, Label: remote.Label, Note: remote.Note, IsActive: remote.IsActive, Origin: remote.Origin}
+	return domain.RemoteMailbox{AnonymousID: remote.AnonymousID, Email: remote.Email, ForwardToEmail: remote.ForwardToEmail, Label: remote.Label, Note: remote.Note, IsActive: remote.IsActive, Origin: remote.Origin}
 }
 
 func matchRemote(remotes []protocol.ICloudRemoteMailbox, anonymousID, email string) (protocol.ICloudRemoteMailbox, bool) {

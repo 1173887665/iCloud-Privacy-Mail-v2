@@ -72,8 +72,10 @@ let deleteSucceeded = 0
 let deleteFailed = 0
 let deleteLastError = ''
 let syncExistingNoticeID = null
+let syncExistingMessagesNoticeID = null
 let cleanAllNoticeID = null
 let mailboxSyncBatch = null
+const mailboxMessageSyncHint = '同步该邮箱所属 Apple 主号的所有新邮件；IMAP 主路径，iCloud Web 补查并自动合并'
 const { success, error: showError, update: updateToast } = useToast()
 const { confirm: confirmAction } = useConfirm()
 const mailboxStatusOptions = [
@@ -784,6 +786,33 @@ async function syncExistingMailboxes() {
   }
 }
 
+async function syncExistingMailboxMessages() {
+  if (isBusy('sync-existing-messages') || isBusy('sync-existing')) return
+  if (!startBusy('sync-existing-messages')) return
+  syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, '正在读取所有 Apple 主号的全部邮件：IMAP 主路径，并使用 iCloud Web 补查缺失邮件……', 'info', 0)
+  try {
+    const data = await api('/api/mailboxes/sync-messages', { method: 'POST', body: '{}' })
+    await load({ silent: true })
+    const failures = data.failures || []
+    const skipped = data.skipped_mailboxes ? `｜跳过邮箱 ${data.skipped_mailboxes}` : ''
+    const summary = `账号成功 ${data.successful_accounts || 0}/${data.total_accounts || 0}｜IMAP ${data.imap_accounts || 0}｜Web API ${data.web_api_accounts || 0}｜回退 ${data.fallbacks || 0}｜扫描 ${data.scanned || 0}｜匹配 ${data.matched || 0}｜新增 ${data.synced_messages || 0}${skipped}`
+    if (data.failed_accounts) {
+      const latestError = failures.at(-1)
+      const errorText = latestError ? `${latestError.account || latestError.account_id}：${latestError.error}` : '部分账号同步失败'
+      syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, `已完成，${summary}｜失败 ${data.failed_accounts}；${errorText}`, data.successful_accounts ? 'warning' : 'error', 9000)
+      flash(`同步已有邮箱邮件已结束：${summary}，失败 ${data.failed_accounts}`, true)
+    } else if (!data.total_mailboxes) {
+      syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, '没有可同步邮件的已启用 iCloud 邮箱', 'warning', 6000)
+    } else {
+      syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, `同步已有邮箱邮件已完成：${summary}`, 'success', 7000)
+    }
+  } catch (err) {
+    syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, `同步已有邮箱邮件失败：${err.message}`, 'error', 9000)
+  } finally {
+    finishBusy('sync-existing-messages')
+  }
+}
+
 async function openMailbox(mailbox) {
   if (!startRowBusy(mailbox.id, 'detail')) return
   code.value = null
@@ -858,40 +887,37 @@ function finishMailboxSync(batch, successful) {
   mailboxSyncBatch = null
 }
 
-async function syncMailbox() {
-  if (!selected.value) return
-  if (!startBusy('sync')) return
-  const batch = beginMailboxSync()
-  let successful = false
-  try {
-    const data = await api(`/api/mailboxes/${selected.value.id}/sync`, { method: 'POST' })
-    successful = true
-    flash(`同步完成，新增 ${data.synced} 封邮件`)
-    await openMailbox(selected.value)
-    await load()
-  } catch (err) {
-    flash(err.message, true)
-  } finally {
-    finishMailboxSync(batch, successful)
-    finishBusy('sync')
-  }
+function mailboxMessageSyncSummary(data) {
+  return `IMAP ${data.imap_accounts || 0}｜Web API ${data.web_api_accounts || 0}｜扫描 ${data.scanned || 0}｜匹配 ${data.matched || 0}｜新增 ${data.synced_messages || data.synced || 0}`
 }
 
-async function quickSyncMailbox(mailbox) {
-  if (!startRowBusy(mailbox.id, 'sync')) return
+async function runMailboxMessageSync(mailbox, { detail = false } = {}) {
+  if (!mailbox) return
+  const started = detail ? startBusy('sync') : startRowBusy(mailbox.id, 'sync')
+  if (!started) return
   const batch = beginMailboxSync()
   let successful = false
   try {
     const data = await api(`/api/mailboxes/${mailbox.id}/sync`, { method: 'POST' })
     successful = true
-    flash(`同步完成，新增 ${data.synced} 封邮件`)
+    flash(`同步完成：${mailboxMessageSyncSummary(data)}`)
+    if (detail) await openMailbox(mailbox)
     await load()
   } catch (err) {
     flash(err.message, true)
   } finally {
     finishMailboxSync(batch, successful)
-    finishRowBusy(mailbox.id, 'sync')
+    if (detail) finishBusy('sync')
+    else finishRowBusy(mailbox.id, 'sync')
   }
+}
+
+async function syncMailbox() {
+  await runMailboxMessageSync(selected.value, { detail: true })
+}
+
+async function quickSyncMailbox(mailbox) {
+  await runMailboxMessageSync(mailbox)
 }
 
 async function getCode() {
@@ -1275,14 +1301,14 @@ onBeforeUnmount(() => {
           <CardSelect v-model="status" class="mailbox-status-filter" :options="mailboxStatusOptions" aria-label="邮箱状态" compact />
         </div>
         <div class="mailbox-command-actions">
-          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing')" @click="openSyncDialog"><LoaderCircle v-if="isBusy('sync-existing')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync-existing') ? '正在同步邮箱' : '同步已有邮箱' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing') || isBusy('sync-existing-messages')" @click="openSyncDialog"><LoaderCircle v-if="isBusy('sync-existing')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync-existing') ? '正在同步邮箱' : '同步已有邮箱' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing-messages') || isBusy('sync-existing')" title="读取所有 Apple 主号的全部邮件；IMAP 主路径，iCloud Web 补查并自动合并" @click="syncExistingMailboxMessages"><LoaderCircle v-if="isBusy('sync-existing-messages')" :size="14" class="animate-spin" /><MailOpen v-else :size="14" />{{ isBusy('sync-existing-messages') ? '正在同步邮件' : '同步已有邮箱邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('import')" @click="openImportDialog"><LoaderCircle v-if="isBusy('import')" :size="14" class="animate-spin" /><MailPlus v-else :size="14" />{{ isBusy('import') ? '正在导入邮箱' : '导入本地邮箱' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="扫描并彻底删除全部 Apple 账号的云端和本地邮件" @click="cleanAllAppleMail"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed || 0}/${appleMailCleanup.total_accounts || 0}` : '全部彻底清理 Apple 邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="isBusy('bulk-delete-resolve')" title="按邮箱地址批量彻底删除 Apple 云端和本地邮箱" @click="openBulkDeleteDialog"><Trash2 :size="14" />批量删除指定邮箱</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="!selectedDeletableCount || deleteConfirmID === 'selected'" :title="selectedDeletableCount ? `彻底删除选中的 ${selectedDeletableCount} 个邮箱` : '请先选择未进入删除队列的邮箱'" @click="removeSelectedMailboxes"><LoaderCircle v-if="deleteConfirmID === 'selected'" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />删除选中{{ selectedDeletableCount ? `（${selectedDeletableCount}）` : '' }}</button>
         </div>
       </div>
-
       <div v-if="loadingVisible" class="mailbox-loading-mask"><div><LoaderCircle :size="16" class="animate-spin" />正在加载邮箱</div></div>
       <div ref="mailboxTableViewport" class="mailbox-table-viewport" :style="{ '--mailbox-table-height': `${mailboxTableHeight}px`, '--mailbox-empty-height': `${mailboxEmptyHeight}px` }">
         <table class="mailbox-pool-table" :class="{ 'mailbox-pool-table-empty': !result.items?.length }">
@@ -1300,7 +1326,7 @@ onBeforeUnmount(() => {
               <td class="mailbox-sync-time">{{ formatTime(mailbox.last_sync_at) }}</td>
               <td>
                 <div class="mailbox-row-actions">
-                  <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': rowBusyAction(mailbox.id) === 'sync' }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="同步该邮箱的最新邮件" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'sync'" :size="12" class="animate-spin" /><RefreshCw v-else :size="12" />同步</button>
+                  <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': rowBusyAction(mailbox.id) === 'sync' }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="mailboxMessageSyncHint" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'sync'" :size="12" class="animate-spin" /><RefreshCw v-else :size="12" />同步</button>
                   <button class="mailbox-action-button mailbox-action-code" :class="{ 'mailbox-action-code-selected': rowBusyAction(mailbox.id) === 'code' || (codeDialogOpen && codeMailbox?.id === mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="12" class="animate-spin" /><KeyRound v-else :size="12" />取码</button>
                   <button class="mailbox-action-button mailbox-action-detail" :class="{ 'mailbox-action-detail-selected': selected?.id === mailbox.id }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'detail'" :size="12" class="animate-spin" /><MailOpen v-else :size="12" />详情</button>
                   <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="isMailboxDeleting(mailbox.id) ? '正在清理已同步邮件并删除隐私邮箱' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '清理已同步的远端邮件后彻底删除隐私邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="isMailboxDeleting(mailbox.id)" :size="12" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="12" class="animate-spin" /><Trash2 v-else :size="12" />{{ isMailboxDeleting(mailbox.id) ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
@@ -1364,6 +1390,7 @@ onBeforeUnmount(() => {
                 <span :class="selected.icloud_active ? 'bg-sky-100 text-sky-700 dark:bg-sky-900/60 dark:text-sky-200' : 'bg-slate-200 text-slate-500 dark:bg-slate-700 dark:text-slate-300'" class="rounded-md px-2 py-0.5 text-[10px] font-bold">iCloud</span>
               </div>
               <h2 id="mailbox-detail-title" class="truncate text-base font-black">{{ selected.email }}</h2>
+              <p v-if="selected.forward_to_email" class="mt-0.5 truncate text-[10px] text-sky-500">转发主号：{{ selected.forward_to_email }}</p>
               <p class="mt-0.5 truncate font-mono text-[10px] text-slate-400">{{ selected.id }}</p>
               <p v-if="selected.active_lease_id" class="mt-0.5 truncate font-mono text-[10px] text-violet-500">当前租约：{{ selected.active_lease_id }}</p>
             </div>
@@ -1373,7 +1400,7 @@ onBeforeUnmount(() => {
 
         <div class="space-y-3 p-4">
           <div class="grid grid-cols-2 gap-2">
-            <button class="detail-button detail-button-primary" :disabled="isBusy('sync') || isMailboxDeleteBusy(selected.id)" @click="syncMailbox"><RefreshCw :size="14" :class="isBusy('sync') ? 'animate-spin' : ''" />同步邮件</button>
+            <button class="detail-button detail-button-primary" :disabled="isBusy('sync') || isMailboxDeleteBusy(selected.id)" :title="mailboxMessageSyncHint" @click="syncMailbox"><RefreshCw :size="14" :class="isBusy('sync') ? 'animate-spin' : ''" />同步邮件</button>
             <button class="detail-button detail-button-secondary" :disabled="isBusy('code') || isMailboxDeleteBusy(selected.id)" @click="getCode"><LoaderCircle v-if="codeBusyVisible === 'code'" :size="14" class="animate-spin" /><KeyRound v-else :size="14" />获取验证码</button>
           </div>
 

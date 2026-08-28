@@ -5,8 +5,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"icloud-privacy-mail-v2/internal/config"
+	"icloud-privacy-mail-v2/internal/domain"
+	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
 	"icloud-privacy-mail-v2/internal/store"
 )
 
@@ -38,5 +41,83 @@ func TestWatcherStatusPersistsAndPublishes(t *testing.T) {
 		}
 	default:
 		t.Fatal("监听状态变化未发布 SSE")
+	}
+}
+
+func TestGroupsIncludeIMAPAndWebOnlyAccounts(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建 SQLite 数据库失败：%v", err)
+	}
+	defer database.Close()
+	imapSession, err := database.SaveICloudSession(domain.ICloudSession{
+		AppleID: "imap@icloud.com", DSID: "imap-dsid", MailGatewayBaseURL: "https://mail.example.test",
+		Cookies:     []domain.SessionCookie{{Name: "token", Value: "imap-token"}},
+		LoginStates: []domain.LoginState{{Kind: domain.LoginStateICloudIMAP, IMAPEmail: "imap@icloud.com", IMAPUsername: "imap@icloud.com", IMAPAppPassword: "app-password"}},
+	})
+	if err != nil {
+		t.Fatalf("创建 IMAP 测试账号失败：%v", err)
+	}
+	webSession, err := database.SaveICloudSession(domain.ICloudSession{
+		AppleID: "web@icloud.com", DSID: "web-dsid", MailGatewayBaseURL: "https://mail.example.test",
+		Cookies: []domain.SessionCookie{{Name: "token", Value: "web-token"}},
+	})
+	if err != nil {
+		t.Fatalf("创建 Web 测试账号失败：%v", err)
+	}
+	imapMailbox, _, _ := database.UpsertMailboxFromRemote(imapSession.AccountID, domain.RemoteMailbox{Email: "imap-alias@icloud.com", IsActive: true}, "")
+	_, _, _ = database.UpsertMailboxFromRemote(webSession.AccountID, domain.RemoteMailbox{Email: "web-alias@icloud.com", IsActive: true}, "")
+	service := NewService(config.Default(), database, mailboxservice.NewService(config.Default(), database), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	groups := service.groups()
+	imapGroups, webGroups := groupModeCounts(groups)
+	if len(groups) != 2 || imapGroups != 1 || webGroups != 1 {
+		t.Fatalf("双路径监听分组不正确：groups=%+v，IMAP=%d，Web=%d", groups, imapGroups, webGroups)
+	}
+	service.Wake(imapMailbox.ID)
+	select {
+	case <-service.wake:
+		accountIDs := service.takeWakeAccounts()
+		if len(accountIDs) != 1 || accountIDs[0] != imapSession.AccountID {
+			t.Fatalf("主动唤醒账号错误：得到 %v，期望 %q", accountIDs, imapSession.AccountID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("主动唤醒没有投递目标账号")
+	}
+}
+
+func TestWakeDeduplicatesSameAccount(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建 SQLite 数据库失败：%v", err)
+	}
+	defer database.Close()
+	session, err := database.SaveICloudSession(domain.ICloudSession{AppleID: "wake@icloud.com"})
+	if err != nil {
+		t.Fatalf("创建测试账号失败：%v", err)
+	}
+	first, _, _ := database.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{Email: "first-wake@icloud.com", IsActive: true}, "")
+	second, _, _ := database.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{Email: "second-wake@icloud.com", IsActive: true}, "")
+	service := NewService(config.Default(), database, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	service.Wake(first.ID)
+	service.Wake(first.ID)
+	service.Wake(second.ID)
+	accountIDs := service.takeWakeAccounts()
+	if len(accountIDs) != 1 || accountIDs[0] != session.AccountID {
+		t.Fatalf("同账号主动唤醒未去重：%v", accountIDs)
+	}
+}
+
+func TestWebPollDelayUsesBackoffAndBoundedJitter(t *testing.T) {
+	cfg := config.Default()
+	cfg.MailWatcherWebPollMS = 60000
+	service := &Service{cfg: cfg}
+	base := service.webPollDelay("account-1", 0)
+	retry := service.webPollDelay("account-1", 2)
+	if base < time.Minute || base > 72*time.Second {
+		t.Fatalf("Web 首次轮询间隔超出预期：%s", base)
+	}
+	if retry < 4*time.Minute || retry > 5*time.Minute {
+		t.Fatalf("Web 失败退避间隔超出预期：%s", retry)
 	}
 }

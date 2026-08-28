@@ -83,6 +83,35 @@ func TestAppleKeepAliveRoundRecordsTransientFailure(t *testing.T) {
 	assertKeepAliveEvent(t, state, "Apple 登录态保活临时失败：keepalive@example.com")
 }
 
+func TestAppleKeepAliveRoundStopsSilentlyWhenServiceIsCanceled(t *testing.T) {
+	state, _ := newKeepAliveTestState(t, true, time.Now().Add(-time.Hour))
+	server := New(config.Default(), state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	called := make(chan struct{})
+	server.keepAliveState = func(ctx context.Context, loginState domain.LoginState) (domain.LoginState, error) {
+		close(called)
+		<-ctx.Done()
+		return loginState, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		server.keepAliveAppleRound(ctx, 3*time.Minute)
+		close(done)
+	}()
+	<-called
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("取消服务后保活轮次没有及时退出")
+	}
+	for _, event := range state.Dashboard().Events {
+		if strings.Contains(event.Message, "保活临时失败") || strings.Contains(event.Message, "登录态已失效") {
+			t.Fatalf("服务关闭不应记录保活失败：%s", event.Message)
+		}
+	}
+}
+
 func TestAppleKeepAliveRoundSkipsFreshAndFailedStates(t *testing.T) {
 	for _, testCase := range []struct {
 		name          string

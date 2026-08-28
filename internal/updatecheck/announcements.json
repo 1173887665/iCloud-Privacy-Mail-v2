@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.0.0",
-    "name": "2.0.0 源码版",
-    "notes": "发现新版本，请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-28T00:00:00+08:00",
+    "version": "2.1.0",
+    "name": "2.1.0 源码版",
+    "notes": "新增 Apple 主号级 IMAP 与 iCloud Web 双路径读信、全量历史邮件同步、全站统一悬浮提示、Server 酱通知和按数量保留的 SQLite 自动备份。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-29T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-1-0",
+      "type": "update",
+      "title": "2.1.0 源码版已更新",
+      "summary": "双路径读信、全量邮件同步、统一悬浮提示和系统维护能力已完善。",
+      "content": "同步已有邮箱邮件现在按 Apple 主号扫描全部邮件，IMAP 为主路径，iCloud Web 负责补查隐私邮箱归属，并按 Message-ID 合并去重。表格同步与详情同步共用同一账号级同步服务。全站控件悬浮说明统一使用自定义提示层，并自动避让窗口边缘。该项目只发布源代码，请重新下载 main 分支源码后按 README 构建。",
+      "published_at": "2026-08-29T00:00:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "version-and-announcement-center",
       "type": "system",

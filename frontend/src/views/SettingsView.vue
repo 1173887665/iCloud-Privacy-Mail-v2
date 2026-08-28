@@ -41,10 +41,12 @@ const mailWatcherStatusText = computed(() => {
   if (!runtime.value.mail_watcher_available) return '配置文件已关闭监听能力'
   if (!form.enable_mail_watcher) return '未开启'
   if (!status.running) return '启动中'
-  if (!status.group_count) return '等待可用 IMAP 登录态'
+  if (!status.group_count) return '等待可用读信登录态'
   if (status.last_error) return `运行异常：${status.last_error}`
-  if (!status.connected_worker_count && status.last_idle_error) return `IDLE 连接异常：${status.last_idle_error}`
-  return `正在监听 ${status.group_count} 个账号分组，IDLE 已连接 ${status.connected_worker_count || 0}/${status.worker_count || 0}，已同步 ${status.synced_messages || 0} 封邮件`
+  const imap = `IMAP IDLE ${status.connected_worker_count || 0}/${status.worker_count || 0}`
+  const web = `Web API 轮询 ${status.web_polling_group_count || 0} 个（${Math.round((runtime.value.mail_watcher_web_poll_ms || 60000) / 1000)} 秒）`
+  if (!status.connected_worker_count && status.worker_count && status.last_idle_error) return `IDLE 连接异常，Web API 低频兜底中：${status.last_idle_error}`
+  return `${imap}，${web}，回退 ${status.web_fallbacks || 0} 次，已同步 ${status.synced_messages || 0} 封`
 })
 const mailWatcherStatusClass = computed(() => {
   const status = runtime.value.mail_watcher_status || {}
@@ -263,7 +265,7 @@ onBeforeUnmount(() => {
           <div class="grid gap-4 sm:grid-cols-2">
             <label class="settings-capability-option">
               <span class="settings-capability-option-icon"><Monitor :size="16" /></span>
-              <span class="settings-capability-option-copy"><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 实时接收新邮件。</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">状态：{{ mailWatcherStatusText }}</small></span>
+              <span class="settings-capability-option-copy"><strong>邮件后台监听</strong><small>IMAP 使用 IDLE 实时接收；未配置或断线时由 Web API 低频轮询。</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">状态：{{ mailWatcherStatusText }}</small></span>
               <input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" />
             </label>
             <label class="settings-capability-option">
@@ -336,7 +338,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="grid gap-px bg-slate-200 dark:bg-slate-700 sm:grid-cols-2 lg:grid-cols-4">
-          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.0.0' }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.1.0' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><GitCommit :size="12" />构建提交</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ shortCommit(updateState.status?.current?.commit) }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><Monitor :size="12" />运行平台</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current ? `${updateState.status.current.os} / ${updateState.status.current.arch}` : '-' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><CalendarClock :size="12" />检查时间</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ formatDate(updateState.status?.checked_at) }}</strong></div>

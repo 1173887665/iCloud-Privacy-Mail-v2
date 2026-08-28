@@ -3,6 +3,7 @@ package protocol
 import (
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestAppleAccountEmptyUnauthorizedResponseIsAuthFailure(t *testing.T) {
@@ -13,5 +14,37 @@ func TestAppleAccountEmptyUnauthorizedResponseIsAuthFailure(t *testing.T) {
 	}
 	if message == "" {
 		t.Fatal("空响应 401 缺少错误说明")
+	}
+}
+
+func TestCanonicalMailIDNormalizesMessageIDAcrossReadPaths(t *testing.T) {
+	receivedAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	fromIMAP := canonicalMailID("<Message-42@Example.COM>", "sender@example.com", "主题", receivedAt)
+	fromWeb := canonicalMailID("message-42@example.com", "other@example.com", "不同主题", receivedAt.Add(time.Hour))
+	if fromIMAP != fromWeb || fromIMAP != "message-id:message-42@example.com" {
+		t.Fatalf("跨路径 Message-ID 规范化结果不一致：IMAP=%q，Web=%q", fromIMAP, fromWeb)
+	}
+}
+
+func TestMailHeaderValueReadsFoldedMessageID(t *testing.T) {
+	header := "From: sender@example.com\r\nMessage-ID:\r\n <folded-42@example.com>\r\nSubject: 测试"
+	if value := mailHeaderValue(header, "Message-ID"); value != "<folded-42@example.com>" {
+		t.Fatalf("长邮件头 Message-ID 解析错误：%q", value)
+	}
+}
+
+func TestMailThreadSearchLimitUsesFolderCountForFullScan(t *testing.T) {
+	options := MailSyncOptions{FullScan: true, Limit: 20}
+	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 738}, options); limit != 738 {
+		t.Fatalf("全量 Web 同步仍被固定条数截断：%d", limit)
+	}
+	if limit := mailThreadSearchLimit(mailFolder{}, options); limit <= 50 {
+		t.Fatalf("缺少文件夹计数时不应退回最近 50 封：%d", limit)
+	}
+}
+
+func TestMailThreadSearchLimitKeepsIncrementalBound(t *testing.T) {
+	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 738}, MailSyncOptions{Limit: 20}); limit != 20 {
+		t.Fatalf("增量同步限制不正确：%d", limit)
 	}
 }
