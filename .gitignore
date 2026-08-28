@@ -4,5 +4,4 @@ data/
 config.json
 frontend/dist/
 frontend/node_modules/
-internal/webui/dist/assets/
 .playwright-cli/
