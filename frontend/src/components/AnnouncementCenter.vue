@@ -102,7 +102,6 @@ onBeforeUnmount(() => {
           <p class="mt-3 text-sm font-bold text-slate-500 dark:text-slate-300">暂无公告</p>
           <p class="mt-1 text-xs text-slate-400">版本更新和项目消息会显示在这里。</p>
         </div>
-        <div v-if="updateState.status?.announcement_error" class="border-t border-slate-100 bg-amber-50 px-4 py-2 text-[10px] leading-4 text-amber-700 dark:border-slate-700 dark:bg-amber-950/30 dark:text-amber-300">{{ updateState.status.announcement_error }}</div>
       </section>
     </Transition>
   </div>

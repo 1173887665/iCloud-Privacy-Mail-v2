@@ -497,6 +497,7 @@ func (s *Store) SaveSettings(settings domain.Settings) (domain.Settings, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	settings.PublicAPIKey = strings.TrimSpace(settings.PublicAPIKey)
+	settings.ServerChanSendKey = strings.TrimSpace(settings.ServerChanSendKey)
 	settings.AppleAccountModuleReady = true
 	tx, err := s.db.Begin()
 	if err != nil {

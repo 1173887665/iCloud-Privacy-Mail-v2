@@ -22,6 +22,7 @@ import (
 	"icloud-privacy-mail-v2/internal/mailwatcher"
 	"icloud-privacy-mail-v2/internal/protocol"
 	"icloud-privacy-mail-v2/internal/scheduler"
+	"icloud-privacy-mail-v2/internal/serverchan"
 	"icloud-privacy-mail-v2/internal/store"
 	"icloud-privacy-mail-v2/internal/updatecheck"
 	"icloud-privacy-mail-v2/internal/webui"
@@ -47,6 +48,7 @@ type Server struct {
 	scheduler           *scheduler.Service
 	watcher             *mailwatcher.Service
 	updates             *updatecheck.Service
+	serverChan          serverchan.Sender
 	log                 *slog.Logger
 	mux                 *http.ServeMux
 	keepAliveMu         sync.RWMutex
@@ -69,6 +71,7 @@ func New(cfg config.Config, state *store.Store, logger *slog.Logger) *Server {
 		apple:            apple.NewService(cfg, state),
 		mailbox:          mailboxservice.NewService(cfg, state),
 		updates:          updatecheck.New(cfg.UpdateEnabled, cfg.UpdateRepository),
+		serverChan:       serverchan.NewClient(),
 		log:              logger,
 		mux:              http.NewServeMux(),
 		keepAliveTargets: make(map[string]appleKeepAliveTarget),
@@ -132,6 +135,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/tasks", s.protected(s.handleTasks))
 	s.mux.HandleFunc("GET /api/settings", s.protected(s.handleSettings))
 	s.mux.HandleFunc("PUT /api/settings", s.protected(s.handleSaveSettings))
+	s.mux.HandleFunc("POST /api/server-chan/test", s.protected(s.handleServerChanTest))
 	s.mux.HandleFunc("GET /api/update/status", s.protected(s.handleUpdateStatus))
 	s.mux.HandleFunc("GET /api/create-settings", s.protected(s.handleCreateSettings))
 	s.mux.HandleFunc("PUT /api/create-settings", s.protected(s.handleSaveCreateSettings))
@@ -165,6 +169,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	go s.runMailboxLeaseReaper(ctx)
 	go s.runDatabaseMaintenance(ctx)
 	go s.runMessageContentBackfill(ctx)
+	s.startAccountLoginStateNotifications(ctx)
 	if s.cfg.AppleAccountKeepAliveEnabled {
 		go s.runAppleKeepAlive(ctx)
 	}
@@ -482,6 +487,7 @@ func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, result)
+	s.notifyAdminLogin(r, result.Admin)
 	writeJSON(w, http.StatusCreated, map[string]any{"success": true, "data": map[string]any{"admin": publicAdmin(result.Admin)}})
 }
 
@@ -497,6 +503,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, result)
+	s.notifyAdminLogin(r, result.Admin)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"admin": publicAdmin(result.Admin)}})
 }
 
@@ -953,7 +960,7 @@ func enabledTaskStatus(enabled bool) string {
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
-	settings := s.store.Settings()
+	settings := s.serverChanSettings()
 	apiKeySource := ""
 	if strings.TrimSpace(settings.PublicAPIKey) != "" {
 		apiKeySource = "system_settings"
@@ -967,6 +974,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 		"runtime": map[string]any{
 			"database_status":                  s.store.DatabaseStatus(),
 			"database_backup_dir":              s.cfg.DatabaseBackupDir,
+			"database_backup_retention_count":  s.cfg.DatabaseBackupRetentionCount,
 			"database_message_retention_days":  s.cfg.DatabaseMessageRetentionDays,
 			"mail_watcher_available":           s.cfg.MailWatcherEnabled,
 			"mail_watcher_poll_ms":             s.cfg.MailWatcherPollMS,
@@ -981,14 +989,27 @@ func (s *Server) handleSettings(w http.ResponseWriter, _ *http.Request) {
 			"api_key_source":                   apiKeySource,
 			"config_api_key_configured":        strings.TrimSpace(s.cfg.APIKey) != "",
 			"public_base_url":                  s.cfg.PublicBaseURL,
+			"server_chan_configured":           strings.TrimSpace(settings.ServerChanSendKey) != "",
+			"server_chan_send_key_masked":      maskServerChanSendKey(settings.ServerChanSendKey),
 		},
 	}})
 }
 
 func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
-	var settings domain.Settings
-	if err := decodeJSON(r, &settings); err != nil {
+	var body struct {
+		domain.Settings
+		ClearServerChanSendKey bool `json:"clear_server_chan_send_key"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	settings := body.Settings
+	if strings.TrimSpace(settings.ServerChanSendKey) == "" && !body.ClearServerChanSendKey {
+		settings.ServerChanSendKey = s.serverChanSettings().ServerChanSendKey
+	}
+	if err := validateServerChanSettings(settings); err != nil {
+		writeError(w, http.StatusBadRequest, "server_chan_settings_invalid", err.Error())
 		return
 	}
 	saved, err := s.store.SaveSettings(settings)
@@ -997,7 +1018,13 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.watcher.Wake("")
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"settings": saved}})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"settings": saved,
+		"runtime": map[string]any{
+			"server_chan_configured":      strings.TrimSpace(saved.ServerChanSendKey) != "",
+			"server_chan_send_key_masked": maskServerChanSendKey(saved.ServerChanSendKey),
+		},
+	}})
 }
 
 func (s *Server) handleCreateSettings(w http.ResponseWriter, _ *http.Request) {

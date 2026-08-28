@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { CalendarClock, CheckCircle2, CircleAlert, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, Monitor, PackageOpen, RefreshCw, Save, ShieldCheck, Sparkles } from '@lucide/vue'
+import { Bell, CalendarClock, CheckCircle2, CircleAlert, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, LogIn, Monitor, PackageOpen, RefreshCw, Save, Send, ShieldCheck, Sparkles, WifiOff } from '@lucide/vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api/client'
 import { subscribeRealtime } from '../composables/useRealtime'
@@ -23,6 +23,10 @@ const form = reactive({
   enable_public_code_page: false,
   public_api_key: '',
   apple_account_module_ready: true,
+  server_chan_send_key: '',
+  server_chan_hide_ip: true,
+  notify_admin_login: false,
+  notify_account_login_state_offline: false,
 })
 const { success, error: showError } = useToast()
 const { updateState, showChecking, loadUpdates } = useUpdates()
@@ -35,9 +39,9 @@ const publicAPIKeySourceText = computed(() => {
 const mailWatcherStatusText = computed(() => {
   const status = runtime.value.mail_watcher_status || {}
   if (!runtime.value.mail_watcher_available) return '配置文件已关闭监听能力'
-  if (!form.enable_mail_watcher) return '当前未开启'
-  if (!status.running) return '后台监听正在启动'
-  if (!status.group_count) return '等待可用的 IMAP 登录态和邮箱'
+  if (!form.enable_mail_watcher) return '未开启'
+  if (!status.running) return '启动中'
+  if (!status.group_count) return '等待可用 IMAP 登录态'
   if (status.last_error) return `运行异常：${status.last_error}`
   if (!status.connected_worker_count && status.last_idle_error) return `IDLE 连接异常：${status.last_idle_error}`
   return `正在监听 ${status.group_count} 个账号分组，IDLE 已连接 ${status.connected_worker_count || 0}/${status.worker_count || 0}，已同步 ${status.synced_messages || 0} 封邮件`
@@ -49,6 +53,8 @@ const mailWatcherStatusClass = computed(() => {
   return 'text-amber-500'
 })
 const databaseStatus = computed(() => runtime.value.database_status || {})
+const serverChanReady = computed(() => Boolean(String(form.server_chan_send_key || '').trim() || runtime.value.server_chan_configured))
+const serverChanKeyPlaceholder = '输入 SCT 开头的 SendKey'
 
 function formatBytes(value) {
   const bytes = Number(value || 0)
@@ -92,10 +98,30 @@ async function saveSystem() {
   try {
     const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(form) })
     Object.assign(form, data.settings || {})
+    Object.assign(runtime.value, data.runtime || {})
     runtime.value.api_configured = Boolean(String(form.public_api_key || '').trim() || runtime.value.config_api_key_configured)
     runtime.value.api_key_source = String(form.public_api_key || '').trim() ? 'system_settings' : (runtime.value.config_api_key_configured ? 'config' : '')
     notify('系统设置已保存')
   } catch (err) { notify(err.message, true) } finally { saving.value = '' }
+}
+
+async function testServerChan() {
+  if (saving.value) return
+  saving.value = 'server-chan-test'
+  try {
+    const data = await api('/api/server-chan/test', {
+      method: 'POST',
+      body: JSON.stringify({
+        send_key: form.server_chan_send_key,
+        hide_ip: form.server_chan_hide_ip,
+      }),
+    })
+    notify(data.message || '测试推送已加入 Server 酱队列')
+  } catch (err) {
+    notify(err.message, true)
+  } finally {
+    saving.value = ''
+  }
 }
 
 async function refreshRuntime() {
@@ -206,7 +232,7 @@ onBeforeUnmount(() => {
               <div class="database-actions">
                 <span class="database-storage-meta">
                   <span>SQLite 数据库：<code>{{ dataPath || 'data/app.db' }}</code></span>
-                  <span>自动保留 {{ runtime.database_message_retention_days || 90 }} 天邮件，备份目录：<code>{{ runtime.database_backup_dir || '-' }}</code></span>
+                  <span>邮件保留 {{ runtime.database_message_retention_days || 90 }} 天；自动备份最多 {{ runtime.database_backup_retention_count || 3 }} 份：<code>{{ runtime.database_backup_dir || '-' }}</code></span>
                 </span>
                 <div>
                   <button type="button" class="secondary-button" :disabled="Boolean(saving)" @click="runDatabaseAction('check')"><LoaderCircle v-if="saving === 'database-check'" :size="14" class="animate-spin" /><ShieldCheck v-else :size="14" />完整性检查</button>
@@ -220,17 +246,59 @@ onBeforeUnmount(() => {
         <section class="settings-public-access">
           <h3 class="section-title flex items-center gap-2"><Globe2 :size="16" />公共访问</h3>
           <div class="grid gap-4 sm:grid-cols-2">
-            <label class="toggle-card">
-              <span><strong class="flex items-center gap-2"><Globe2 :size="15" />公共取号 API</strong><small>开放取号、批量查询和带密钥的邮箱取码接口；请求仍需 API Key。</small></span>
+            <label class="settings-access-option">
+              <span class="settings-access-option-icon"><Globe2 :size="16" /></span>
+              <span class="settings-access-option-copy"><strong>公共取号 API</strong><small>开放取号和批量查询接口，需 API Key。</small></span>
               <input v-model="form.enable_public_mailbox_api" class="detail-switch" type="checkbox" />
             </label>
-            <label class="toggle-card">
-              <span><strong class="flex items-center gap-2"><KeyRound :size="15" />公共邮箱取码页面</strong><small>允许外部用户输入邮箱获取验证码、同步邮件并查看完整正文，不显示后台入口。</small></span>
+            <label class="settings-access-option">
+              <span class="settings-access-option-icon"><KeyRound :size="16" /></span>
+              <span class="settings-access-option-copy"><strong>公共邮箱取码页面</strong><small>输入邮箱即可获取验证码并查看邮件。</small></span>
               <input v-model="form.enable_public_code_page" class="detail-switch" type="checkbox" />
             </label>
           </div>
         </section>
-        <section class="settings-background-capabilities"><h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3><div class="grid gap-4 sm:grid-cols-2"><label class="toggle-card"><span><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 接收事件，每 {{ runtime.mail_watcher_poll_ms || 3000 }} 毫秒重检分组；首次最多拉取 {{ runtime.mail_watcher_initial_fetch_limit || 20 }} 封</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">当前状态：{{ mailWatcherStatusText }}</small></span><input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" /></label><label class="toggle-card"><span><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span><input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" /></label></div></section>
+        <section class="settings-background-capabilities">
+          <h3 class="section-title flex items-center gap-2"><ShieldCheck :size="16" />后台能力</h3>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><Monitor :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>IMAP 实时邮件监听</strong><small>使用 IDLE 实时接收新邮件。</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">状态：{{ mailWatcherStatusText }}</small></span>
+              <input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" />
+            </label>
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><RefreshCw :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span>
+              <input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" />
+            </label>
+          </div>
+        </section>
+        <section class="settings-server-chan">
+          <div class="server-chan-card">
+            <header class="server-chan-heading">
+              <div class="server-chan-title">
+                <span><Bell :size="18" /></span>
+                <div><h3>Server 酱消息推送</h3><p>通过 sct.ftqq.com 把关键运行事件推送到默认微信消息通道。</p></div>
+              </div>
+            </header>
+            <div class="server-chan-body">
+              <label class="form-group server-chan-key-field">
+                <span class="form-label">SendKey</span>
+                <span class="server-chan-key-wrap"><span class="server-chan-key-icon"><KeyRound :size="16" /></span><input v-model.trim="form.server_chan_send_key" class="field font-mono" type="text" autocomplete="off" maxlength="180" :placeholder="serverChanKeyPlaceholder" /></span>
+                <small class="form-help">SendKey 默认显示，并使用本地数据库加密保存；推送使用 Server 酱网站配置的默认微信消息通道。</small>
+              </label>
+              <div class="server-chan-options">
+                <label class="server-chan-option"><span class="server-chan-option-icon"><LogIn :size="16" /></span><span class="server-chan-option-copy"><strong>后台登录通知</strong><small>管理员成功登录后推送账号、时间、访问地址和浏览器信息。</small></span><input v-model="form.notify_admin_login" class="detail-switch" type="checkbox" /></label>
+                <label class="server-chan-option"><span class="server-chan-option-icon"><WifiOff :size="16" /></span><span class="server-chan-option-copy"><strong>账号与登录态掉线通知</strong><small>Apple Account、iCloud Web 或 IMAP 由正常转为异常时推送，同一掉线状态不重复发送。</small></span><input v-model="form.notify_account_login_state_offline" class="detail-switch" type="checkbox" /></label>
+                <label class="server-chan-option"><span class="server-chan-option-icon"><ShieldCheck :size="16" /></span><span class="server-chan-option-copy"><strong>隐藏调用 IP</strong><small>向 Server 酱提交 <code>noip=1</code>，消息中不显示本服务的外网调用 IP。</small></span><input v-model="form.server_chan_hide_ip" class="detail-switch" type="checkbox" /></label>
+              </div>
+            </div>
+            <footer class="server-chan-footer">
+              <span :class="serverChanReady ? 'is-ready' : ''"><i></i>{{ serverChanReady ? '推送凭据已就绪' : '等待配置 SendKey' }}</span>
+              <div><a href="https://sct.ftqq.com/" target="_blank" rel="noopener noreferrer">Server 酱控制台<ExternalLink :size="12" /></a><button type="button" class="secondary-button" :disabled="Boolean(saving) || !serverChanReady" @click="testServerChan"><LoaderCircle v-if="saving === 'server-chan-test'" :size="14" class="animate-spin" /><Send v-else :size="14" />{{ saving === 'server-chan-test' ? '提交中' : '发送测试' }}</button></div>
+            </footer>
+          </div>
+        </section>
         <section class="settings-public-key">
           <div class="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800">
             <div class="flex items-start justify-between gap-3"><div><h4 class="flex items-center gap-2 text-sm font-black"><KeyRound :size="15" class="text-emerald-500" />公共取号 API Key</h4><p class="mt-1 text-xs leading-5 text-slate-400">外部调用取号、批量查询接口时使用；来源：{{ publicAPIKeySourceText }}。</p></div><span :class="publicAPIKeyReady ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300'" class="shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold">{{ publicAPIKeyReady ? '已配置' : '待设置' }}</span></div>
@@ -254,7 +322,7 @@ onBeforeUnmount(() => {
             <span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300"><RefreshCw :size="20" /></span>
             <div class="min-w-0">
               <h2 class="text-base font-black text-slate-900 dark:text-slate-100">版本与更新</h2>
-              <p class="mt-1 text-xs leading-5 text-slate-400">检查 GitHub Release 和默认分支最新提交；当前只提供查看，不会自动替换本地程序。</p>
+              <p class="mt-1 text-xs leading-5 text-slate-400">根据仓库公告配置检查版本，无需 API Token；当前只提供查看。</p>
             </div>
           </div>
           <div class="flex shrink-0 flex-wrap gap-2">
@@ -268,7 +336,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="grid gap-px bg-slate-200 dark:bg-slate-700 sm:grid-cols-2 lg:grid-cols-4">
-          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.0.0-dev' }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.0.0' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><GitCommit :size="12" />构建提交</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ shortCommit(updateState.status?.current?.commit) }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><Monitor :size="12" />运行平台</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current ? `${updateState.status.current.os} / ${updateState.status.current.arch}` : '-' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><CalendarClock :size="12" />检查时间</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ formatDate(updateState.status?.checked_at) }}</strong></div>
@@ -289,9 +357,9 @@ onBeforeUnmount(() => {
                 <p v-if="updateState.status.latest.notes" class="mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-400">{{ updateState.status.latest.notes }}</p>
               </div>
             </div>
-            <a v-if="updateState.status.latest.url" class="secondary-button shrink-0" :href="updateState.status.latest.url" target="_blank" rel="noopener noreferrer"><ExternalLink :size="16" />{{ updateState.status.latest.source === 'release' ? '查看新版本' : '查看提交' }}</a>
+            <a v-if="updateState.status.latest.url" class="secondary-button shrink-0" :href="updateState.status.latest.url" target="_blank" rel="noopener noreferrer"><ExternalLink :size="16" />重新下载源码</a>
           </div>
-          <div v-else class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-400 dark:border-slate-700 dark:bg-slate-900/40">{{ updateState.status?.enabled === false ? '配置文件已关闭更新检查。' : '点击“检查更新”读取 GitHub 最新版本信息。' }}</div>
+          <div v-else class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-400 dark:border-slate-700 dark:bg-slate-900/40">{{ updateState.status?.enabled === false ? '配置文件已关闭更新检查。' : '点击“检查更新”读取仓库公告配置。' }}</div>
         </div>
       </section>
     </template>

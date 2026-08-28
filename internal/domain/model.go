@@ -155,12 +155,16 @@ type Event struct {
 }
 
 type Settings struct {
-	EnableMailWatcher       bool   `json:"enable_mail_watcher"`
-	EnableAppleKeepAlive    bool   `json:"enable_apple_keep_alive"`
-	EnablePublicMailboxAPI  bool   `json:"enable_public_mailbox_api"`
-	EnablePublicCodePage    bool   `json:"enable_public_code_page"`
-	PublicAPIKey            string `json:"public_api_key,omitempty"`
-	AppleAccountModuleReady bool   `json:"apple_account_module_ready"`
+	EnableMailWatcher              bool   `json:"enable_mail_watcher"`
+	EnableAppleKeepAlive           bool   `json:"enable_apple_keep_alive"`
+	EnablePublicMailboxAPI         bool   `json:"enable_public_mailbox_api"`
+	EnablePublicCodePage           bool   `json:"enable_public_code_page"`
+	PublicAPIKey                   string `json:"public_api_key,omitempty"`
+	AppleAccountModuleReady        bool   `json:"apple_account_module_ready"`
+	ServerChanSendKey              string `json:"server_chan_send_key,omitempty"`
+	ServerChanHideIP               bool   `json:"server_chan_hide_ip"`
+	NotifyAdminLogin               bool   `json:"notify_admin_login"`
+	NotifyAccountLoginStateOffline bool   `json:"notify_account_login_state_offline"`
 }
 
 type CreateSettings struct {
@@ -275,6 +279,7 @@ func DefaultSettings() Settings {
 		EnablePublicMailboxAPI:  false,
 		EnablePublicCodePage:    false,
 		AppleAccountModuleReady: true,
+		ServerChanHideIP:        true,
 	}
 }
 

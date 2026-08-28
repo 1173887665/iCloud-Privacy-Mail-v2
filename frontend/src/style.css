@@ -1918,6 +1918,230 @@ textarea.field {
   border-bottom: 0;
 }
 
+.settings-server-chan {
+  grid-column: 1 / -1;
+}
+
+.server-chan-card {
+  overflow: hidden;
+  border: 1px solid var(--app-line);
+  border-radius: 12px;
+  background: var(--app-surface-soft);
+}
+
+.server-chan-heading,
+.server-chan-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.server-chan-heading {
+  border-bottom: 1px solid var(--app-line);
+  background: linear-gradient(105deg, color-mix(in srgb, #22c55e 8%, var(--app-surface)), var(--app-surface));
+}
+
+.server-chan-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.server-chan-title > span {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: #16a34a;
+  background: color-mix(in srgb, #22c55e 14%, var(--app-surface));
+}
+
+.server-chan-title h3,
+.server-chan-title p {
+  margin: 0;
+}
+
+.server-chan-title h3 {
+  color: var(--app-text);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.server-chan-title p {
+  margin-top: 2px;
+  color: var(--app-muted);
+  font-size: 9px;
+}
+
+.server-chan-body {
+  padding: 12px;
+  background: var(--app-surface);
+}
+
+.server-chan-key-field {
+  width: 100%;
+  min-width: 0;
+}
+
+.server-chan-key-wrap {
+  display: flex;
+  align-items: stretch;
+}
+
+.server-chan-key-icon {
+  width: 34px;
+  flex: 0 0 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--app-line);
+  border-right: 0;
+  border-radius: 9px 0 0 9px;
+  color: var(--app-muted);
+  background: var(--app-surface-soft);
+}
+
+.settings-form-body .server-chan-key-wrap > .field {
+  min-width: 0;
+  flex: 1;
+  border-radius: 0 9px 9px 0;
+}
+
+.server-chan-options {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--app-line);
+}
+
+.settings-capability-option,
+.settings-access-option,
+.server-chan-option {
+  min-width: 0;
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--app-line);
+  border-radius: 10px;
+  background: var(--app-surface-soft);
+  cursor: pointer;
+  transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+
+.settings-capability-option:has(input:checked),
+.settings-access-option:has(input:checked),
+.server-chan-option:has(input:checked) {
+  border-color: #34d399;
+  background: color-mix(in srgb, #10b981 11%, var(--app-surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #10b981 30%, transparent);
+}
+
+.settings-capability-option-icon,
+.settings-access-option-icon,
+.server-chan-option-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  justify-self: start;
+  border-radius: 9px;
+  color: var(--app-primary-dark);
+  background: color-mix(in srgb, #10b981 12%, var(--app-surface));
+}
+
+.settings-capability-option-copy,
+.settings-access-option-copy,
+.server-chan-option-copy {
+  min-width: 0;
+  align-self: center;
+}
+
+.settings-capability-option-copy strong,
+.settings-capability-option-copy small,
+.settings-access-option-copy strong,
+.settings-access-option-copy small,
+.server-chan-option-copy strong,
+.server-chan-option-copy small {
+  display: block;
+}
+
+.settings-capability-option-copy strong,
+.settings-access-option-copy strong,
+.server-chan-option-copy strong {
+  color: var(--app-text);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.settings-capability-option-copy small,
+.settings-access-option-copy small,
+.server-chan-option-copy small {
+  margin-top: 3px;
+  color: var(--app-muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.settings-capability-option-copy code,
+.settings-access-option-copy code,
+.server-chan-option-copy code {
+  font-size: inherit;
+}
+
+.server-chan-footer {
+  border-top: 1px solid var(--app-line);
+  color: var(--app-muted);
+  background: var(--app-surface-soft);
+  font-size: 9px;
+}
+
+.server-chan-footer > span,
+.server-chan-footer > div,
+.server-chan-footer a {
+  display: flex;
+  align-items: center;
+}
+
+.server-chan-footer > span {
+  gap: 6px;
+}
+
+.server-chan-footer > span > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #f59e0b;
+}
+
+.server-chan-footer > span.is-ready > i {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #22c55e 12%, transparent);
+}
+
+.server-chan-footer > div {
+  gap: 9px;
+}
+
+.server-chan-footer a {
+  gap: 4px;
+  color: var(--app-primary-dark);
+  font-weight: 700;
+}
+
+.server-chan-footer .secondary-button {
+  min-height: 30px;
+}
+
 .settings-form-body .section-title {
   margin: 0 0 10px;
   color: var(--app-muted);
@@ -2199,6 +2423,12 @@ textarea.field {
   .settings-api-endpoints {
     grid-column: 1 / -1;
     justify-self: end;
+  }
+}
+
+@media (max-width: 920px) {
+  .server-chan-options {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -1,11 +1,19 @@
 {
+  "schema_version": 1,
+  "latest": {
+    "version": "2.0.0",
+    "name": "2.0.0 源码版",
+    "notes": "发现新版本，请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-28T00:00:00+08:00",
+    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+  },
   "announcements": [
     {
       "id": "version-and-announcement-center",
       "type": "system",
       "title": "版本检查与公告中心已启用",
       "summary": "现在可以在系统设置中检查 GitHub 新版本，并通过顶部铃铛查看公告。",
-      "content": "版本号显示在左侧导航底部。系统设置新增“版本与更新”区域，可以检查 GitHub Release 或默认分支的最新提交。顶部铃铛用于显示版本更新和项目公告。当前阶段只提供检查与查看，不会自动替换本地程序。",
+      "content": "版本号显示在左侧导航底部。系统设置新增“版本与更新”区域，读取仓库公告配置中的 latest 判断版本，无需 API Token。顶部铃铛用于显示版本更新和项目公告。当前阶段只提供检查与查看，不会自动替换本地程序。",
       "published_at": "2026-08-10T00:00:00+08:00"
     }
   ]

@@ -23,9 +23,13 @@
   "public_mailbox_lease_max_ttl_minutes": 10080,
   "public_mailbox_lease_sweep_seconds": 30,
   "database_backup_dir": "data/backups",
-  "database_backup_retention_days": 14,
+  "database_backup_retention_count": 3,
   "database_message_retention_days": 90,
   "database_change_log_limit": 5000,
+  "server_chan_send_key": "",
+  "server_chan_hide_ip": true,
+  "server_chan_notify_admin_login": false,
+  "server_chan_notify_login_state_offline": false,
   "update_enabled": true,
   "update_repository": "xiuxiu56/iCloud-Privacy-Mail-v2"
 }

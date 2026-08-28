@@ -33,11 +33,15 @@ type Config struct {
 	PublicMailboxLeaseMaxTTLMinutes    int    `json:"public_mailbox_lease_max_ttl_minutes"`
 	PublicMailboxLeaseSweepSeconds     int    `json:"public_mailbox_lease_sweep_seconds"`
 	DatabaseBackupDir                  string `json:"database_backup_dir"`
-	DatabaseBackupRetentionDays        int    `json:"database_backup_retention_days"`
+	DatabaseBackupRetentionCount       int    `json:"database_backup_retention_count"`
 	DatabaseMessageRetentionDays       int    `json:"database_message_retention_days"`
 	DatabaseChangeLogLimit             int    `json:"database_change_log_limit"`
 	UpdateEnabled                      bool   `json:"update_enabled"`
 	UpdateRepository                   string `json:"update_repository"`
+	ServerChanSendKey                  string `json:"server_chan_send_key"`
+	ServerChanHideIP                   bool   `json:"server_chan_hide_ip"`
+	ServerChanNotifyAdminLogin         bool   `json:"server_chan_notify_admin_login"`
+	ServerChanNotifyLoginStateOffline  bool   `json:"server_chan_notify_login_state_offline"`
 }
 
 func Default() Config {
@@ -63,11 +67,12 @@ func Default() Config {
 		PublicMailboxLeaseMaxTTLMinutes:    7 * 24 * 60,
 		PublicMailboxLeaseSweepSeconds:     30,
 		DatabaseBackupDir:                  filepath.Join("data", "backups"),
-		DatabaseBackupRetentionDays:        14,
+		DatabaseBackupRetentionCount:       3,
 		DatabaseMessageRetentionDays:       90,
 		DatabaseChangeLogLimit:             5000,
 		UpdateEnabled:                      true,
 		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
+		ServerChanHideIP:                   true,
 	}
 }
 
@@ -161,8 +166,8 @@ func Load(path string) (Config, error) {
 		}
 		cfg.DatabaseBackupDir = filepath.Clean(backupDir)
 	}
-	if incoming.DatabaseBackupRetentionDays > 0 {
-		cfg.DatabaseBackupRetentionDays = incoming.DatabaseBackupRetentionDays
+	if incoming.DatabaseBackupRetentionCount > 0 {
+		cfg.DatabaseBackupRetentionCount = incoming.DatabaseBackupRetentionCount
 	}
 	if incoming.DatabaseMessageRetentionDays > 0 {
 		cfg.DatabaseMessageRetentionDays = incoming.DatabaseMessageRetentionDays
@@ -184,6 +189,16 @@ func Load(path string) (Config, error) {
 	}
 	if strings.TrimSpace(incoming.UpdateRepository) != "" {
 		cfg.UpdateRepository = strings.TrimSpace(incoming.UpdateRepository)
+	}
+	cfg.ServerChanSendKey = strings.TrimSpace(incoming.ServerChanSendKey)
+	if _, ok := raw["server_chan_hide_ip"]; ok {
+		cfg.ServerChanHideIP = incoming.ServerChanHideIP
+	}
+	if _, ok := raw["server_chan_notify_admin_login"]; ok {
+		cfg.ServerChanNotifyAdminLogin = incoming.ServerChanNotifyAdminLogin
+	}
+	if _, ok := raw["server_chan_notify_login_state_offline"]; ok {
+		cfg.ServerChanNotifyLoginStateOffline = incoming.ServerChanNotifyLoginStateOffline
 	}
 	return cfg, nil
 }

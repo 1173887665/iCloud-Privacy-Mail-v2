@@ -425,6 +425,7 @@ func (s *Store) transformSecrets(table string, value any, encrypt bool) error {
 		keys["api_token"] = true
 	case "settings":
 		keys["public_api_key"] = true
+		keys["server_chan_send_key"] = true
 	case "icloud_sessions":
 		for _, key := range []string{"value", "api_key", "data_access_token", "imap_app_password"} {
 			keys[key] = true
@@ -573,7 +574,7 @@ func redactSecrets(value any) {
 	case map[string]any:
 		for key, child := range typed {
 			switch key {
-			case "api_token", "public_api_key", "password", "password_hash", "value", "api_key", "data_access_token", "imap_app_password":
+			case "api_token", "public_api_key", "server_chan_send_key", "password", "password_hash", "value", "api_key", "data_access_token", "imap_app_password":
 				delete(typed, key)
 			default:
 				redactSecrets(child)

@@ -3,7 +3,6 @@ package updatecheck
 import (
 	"context"
 	"embed"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +23,7 @@ const (
 	cacheTTL        = 10 * time.Minute
 	requestTimeout  = 20 * time.Second
 	responseMaxSize = 4 << 20
+	githubRawURL    = "https://raw.githubusercontent.com"
 )
 
 //go:embed announcements.json
@@ -46,26 +46,25 @@ type LatestInfo struct {
 	PublishedAt string `json:"published_at"`
 	URL         string `json:"url"`
 	Source      string `json:"source"`
-	Commit      string `json:"commit,omitempty"`
 }
 
 type Status struct {
-	Enabled           bool           `json:"enabled"`
-	Repository        string         `json:"repository"`
-	RepositoryURL     string         `json:"repository_url"`
-	Current           buildinfo.Info `json:"current"`
-	Latest            *LatestInfo    `json:"latest,omitempty"`
-	UpdateAvailable   bool           `json:"update_available"`
-	CheckedAt         string         `json:"checked_at"`
-	Error             string         `json:"error,omitempty"`
-	AnnouncementError string         `json:"announcement_error,omitempty"`
-	Announcements     []Announcement `json:"announcements"`
+	Enabled         bool           `json:"enabled"`
+	Repository      string         `json:"repository"`
+	RepositoryURL   string         `json:"repository_url"`
+	Current         buildinfo.Info `json:"current"`
+	Latest          *LatestInfo    `json:"latest,omitempty"`
+	UpdateAvailable bool           `json:"update_available"`
+	CheckedAt       string         `json:"checked_at"`
+	Error           string         `json:"error,omitempty"`
+	Announcements   []Announcement `json:"announcements"`
 }
 
 type Service struct {
 	enabled    bool
 	repository string
 	client     *http.Client
+	rawBaseURL string
 	mu         sync.Mutex
 	cachedAt   time.Time
 	cached     Status
@@ -84,7 +83,17 @@ func (e *httpStatusError) Error() string {
 }
 
 type announcementDocument struct {
-	Announcements []Announcement `json:"announcements"`
+	SchemaVersion int             `json:"schema_version"`
+	Latest        *latestDocument `json:"latest"`
+	Announcements []Announcement  `json:"announcements"`
+}
+
+type latestDocument struct {
+	Version     string `json:"version"`
+	Name        string `json:"name"`
+	Notes       string `json:"notes"`
+	PublishedAt string `json:"published_at"`
+	URL         string `json:"url"`
 }
 
 func New(enabled bool, repository string) *Service {
@@ -92,10 +101,11 @@ func New(enabled bool, repository string) *Service {
 		enabled:    enabled,
 		repository: strings.Trim(strings.TrimSpace(repository), "/"),
 		client:     &http.Client{Timeout: requestTimeout},
+		rawBaseURL: githubRawURL,
 	}
 }
 
-// Check 检查 GitHub Release、默认分支提交和项目公告。
+// Check 通过仓库 Raw 公告清单检查项目版本和公告。
 func (s *Service) Check(ctx context.Context, force bool) Status {
 	now := time.Now()
 	s.mu.Lock()
@@ -135,156 +145,99 @@ func (s *Service) check(ctx context.Context, checkedAt time.Time) Status {
 		return status
 	}
 
-	if announcements, err := s.fetchRepositoryAnnouncements(ctx); err != nil {
-		status.AnnouncementError = "读取项目公告失败：" + err.Error()
-	} else {
-		status.Announcements = mergeAnnouncements(status.Announcements, announcements)
+	document, documentErr := s.fetchRepositoryDocument(ctx)
+	if documentErr != nil {
+		status.Error = "读取仓库公告配置失败：" + documentErr.Error()
+		return status
 	}
-
-	latest, updateAvailable, releaseAnnouncement, err := s.fetchLatest(ctx, status.Current)
+	status.Announcements = mergeAnnouncements(status.Announcements, document.Announcements)
+	if document.SchemaVersion != 1 {
+		status.Error = fmt.Sprintf("仓库公告配置版本不支持：schema_version 应为 1，当前为 %d", document.SchemaVersion)
+		return status
+	}
+	if document.Latest == nil {
+		status.Error = "仓库公告配置缺少 latest"
+		return status
+	}
+	latest, updateAvailable, updateAnnouncement, err := configuredLatest(status.Current, *document.Latest)
 	if err != nil {
-		status.Error = "检查更新失败：" + err.Error()
+		status.Error = "仓库公告配置无效：" + err.Error()
 		return status
 	}
 	status.Latest = latest
 	status.UpdateAvailable = updateAvailable
-	if releaseAnnouncement != nil {
-		status.Announcements = mergeAnnouncements(status.Announcements, []Announcement{*releaseAnnouncement})
+	if updateAnnouncement != nil {
+		status.Announcements = mergeAnnouncements(status.Announcements, []Announcement{*updateAnnouncement})
 	}
 	return status
 }
 
-func (s *Service) fetchLatest(ctx context.Context, current buildinfo.Info) (*LatestInfo, bool, *Announcement, error) {
-	var release struct {
-		TagName     string `json:"tag_name"`
-		Name        string `json:"name"`
-		Body        string `json:"body"`
-		PublishedAt string `json:"published_at"`
-		HTMLURL     string `json:"html_url"`
+func configuredLatest(current buildinfo.Info, document latestDocument) (*LatestInfo, bool, *Announcement, error) {
+	latest := LatestInfo{
+		Version:     truncateText(strings.TrimSpace(document.Version), 120),
+		Name:        truncateText(strings.TrimSpace(document.Name), 200),
+		Notes:       truncateText(strings.TrimSpace(document.Notes), 8000),
+		PublishedAt: strings.TrimSpace(document.PublishedAt),
+		URL:         safeHTTPSURL(document.URL),
+		Source:      "config",
 	}
-	err := s.getJSON(ctx, "/repos/"+s.repository+"/releases/latest", &release)
-	if err == nil {
-		version := strings.TrimSpace(release.TagName)
-		name := firstNonEmpty(strings.TrimSpace(release.Name), version)
-		notes := truncateText(strings.TrimSpace(release.Body), 8000)
-		latest := &LatestInfo{
-			Version:     version,
-			Name:        name,
-			Notes:       notes,
-			PublishedAt: strings.TrimSpace(release.PublishedAt),
-			URL:         safeHTTPSURL(release.HTMLURL),
-			Source:      "release",
-		}
-		announcement := normalizeAnnouncement(Announcement{
-			ID:          "release-" + normalizeID(version),
-			Type:        "update",
-			Title:       "版本更新 " + firstNonEmpty(version, name),
-			Summary:     firstNonEmpty(firstContentLine(notes), "GitHub 已发布新的项目版本。"),
-			Content:     firstNonEmpty(notes, "GitHub 已发布新的项目版本。"),
-			PublishedAt: latest.PublishedAt,
-			URL:         latest.URL,
-		})
-		return latest, versionIsNewer(current.Version, version), &announcement, nil
+	if latest.Version == "" {
+		return nil, false, nil, errors.New("latest.version 为空")
 	}
-	var statusErr *httpStatusError
-	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusNotFound {
-		return nil, false, nil, err
+	if _, valid := parseVersion(latest.Version); !valid {
+		return nil, false, nil, errors.New("latest.version 应为语义化版本，例如 2.1.0")
 	}
-	return s.fetchDefaultBranch(ctx, current)
-}
-
-func (s *Service) fetchDefaultBranch(ctx context.Context, current buildinfo.Info) (*LatestInfo, bool, *Announcement, error) {
-	var repository struct {
-		DefaultBranch string `json:"default_branch"`
+	if strings.TrimSpace(document.URL) != "" && latest.URL == "" {
+		return nil, false, nil, errors.New("latest.url 应为有效的 HTTPS 地址")
 	}
-	if err := s.getJSON(ctx, "/repos/"+s.repository, &repository); err != nil {
-		return nil, false, nil, fmt.Errorf("仓库没有 Release，读取默认分支失败：%w", err)
-	}
-	branch := strings.TrimSpace(repository.DefaultBranch)
-	if branch == "" {
-		branch = "main"
-	}
-	var commit struct {
-		SHA     string `json:"sha"`
-		HTMLURL string `json:"html_url"`
-		Commit  struct {
-			Message   string `json:"message"`
-			Committer struct {
-				Date string `json:"date"`
-			} `json:"committer"`
-		} `json:"commit"`
-	}
-	if err := s.getJSON(ctx, "/repos/"+s.repository+"/commits/"+url.PathEscape(branch), &commit); err != nil {
-		return nil, false, nil, fmt.Errorf("仓库没有 Release，读取最新提交失败：%w", err)
-	}
-	latestCommit := strings.TrimSpace(commit.SHA)
-	currentCommit := strings.TrimSpace(current.Commit)
-	knownCurrent := currentCommit != "" && currentCommit != "unknown"
-	matches := knownCurrent && (strings.HasPrefix(latestCommit, currentCommit) || strings.HasPrefix(currentCommit, latestCommit))
-	shortCommit := latestCommit
-	if len(shortCommit) > 7 {
-		shortCommit = shortCommit[:7]
-	}
-	message := firstContentLine(commit.Commit.Message)
-	latest := &LatestInfo{
-		Version:     current.Version,
-		Name:        "GitHub 最新源码 " + shortCommit,
-		Notes:       firstNonEmpty(message, "默认分支包含新的源码提交。"),
-		PublishedAt: strings.TrimSpace(commit.Commit.Committer.Date),
-		URL:         safeHTTPSURL(commit.HTMLURL),
-		Source:      "commit",
-		Commit:      latestCommit,
-	}
-	if !knownCurrent || matches {
-		return latest, false, nil, nil
+	latest.Name = firstNonEmpty(latest.Name, latest.Version)
+	updateAvailable := versionIsNewer(current.Version, latest.Version)
+	if !updateAvailable {
+		return &latest, false, nil, nil
 	}
 	announcement := normalizeAnnouncement(Announcement{
-		ID:          "commit-" + shortCommit,
+		ID:          "release-" + normalizeID(latest.Version),
 		Type:        "update",
-		Title:       "源码有新提交 " + shortCommit,
-		Summary:     latest.Notes,
-		Content:     "GitHub 默认分支已有新的源码提交，但目前还没有 Release 安装包。\n\n最新提交：" + latest.Notes,
+		Title:       "版本更新 " + latest.Version,
+		Summary:     firstNonEmpty(firstContentLine(latest.Notes), "项目更新清单已发布新版本。"),
+		Content:     firstNonEmpty(latest.Notes, "项目更新清单已发布新版本。"),
 		PublishedAt: latest.PublishedAt,
 		URL:         latest.URL,
 	})
-	return latest, true, &announcement, nil
+	return &latest, updateAvailable, &announcement, nil
 }
 
-func (s *Service) fetchRepositoryAnnouncements(ctx context.Context) ([]Announcement, error) {
-	var content struct {
-		Encoding string `json:"encoding"`
-		Content  string `json:"content"`
-	}
-	err := s.getJSON(ctx, "/repos/"+s.repository+"/contents/internal/updatecheck/announcements.json", &content)
-	if err != nil {
-		var statusErr *httpStatusError
-		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if !strings.EqualFold(strings.TrimSpace(content.Encoding), "base64") {
-		return nil, errors.New("公告文件编码不是 base64")
-	}
-	raw, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(content.Content, "\n", ""))
-	if err != nil {
-		return nil, fmt.Errorf("解析公告文件失败：%w", err)
-	}
+func (s *Service) fetchRepositoryDocument(ctx context.Context) (announcementDocument, error) {
+	announcementsURL := strings.TrimRight(s.rawBaseURL, "/") + "/" + s.repository + "/HEAD/internal/updatecheck/announcements.json?t=" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	var document announcementDocument
-	if err := json.Unmarshal(raw, &document); err != nil {
-		return nil, fmt.Errorf("公告文件格式错误：%w", err)
+	if err := s.getJSON(ctx, announcementsURL, &document); err != nil {
+		return announcementDocument{}, err
 	}
-	return normalizeAnnouncements(document.Announcements), nil
+	document.Announcements = normalizeAnnouncements(document.Announcements)
+	return document, nil
 }
 
-func (s *Service) getJSON(ctx context.Context, path string, target any) error {
+func (s *Service) getJSON(ctx context.Context, targetURL string, target any) error {
+	return s.get(ctx, targetURL, "application/json", func(reader io.Reader) error {
+		decoder := json.NewDecoder(reader)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(target); err != nil {
+			return fmt.Errorf("解析 JSON 失败：%w", err)
+		}
+		return nil
+	})
+}
+
+func (s *Service) get(ctx context.Context, targetURL, accept string, decode func(io.Reader) error) error {
 	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "https://api.github.com"+path, nil)
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Accept", accept)
+	request.Header.Set("Cache-Control", "no-cache")
+	request.Header.Set("Pragma", "no-cache")
 	request.Header.Set("User-Agent", "iCloud-Privacy-Mail-v2-Updater/"+buildinfo.Current().Version)
 	response, err := s.client.Do(request)
 	if err != nil {
@@ -295,7 +248,7 @@ func (s *Service) getJSON(ctx context.Context, path string, target any) error {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
 		return &httpStatusError{StatusCode: response.StatusCode, Body: string(body)}
 	}
-	return json.NewDecoder(io.LimitReader(response.Body, responseMaxSize)).Decode(target)
+	return decode(io.LimitReader(response.Body, responseMaxSize))
 }
 
 func builtinAnnouncements() []Announcement {
@@ -376,37 +329,32 @@ func safeHTTPSURL(value string) string {
 }
 
 func versionIsNewer(current, latest string) bool {
-	current = normalizeVersion(current)
-	latest = normalizeVersion(latest)
-	if latest == "" {
+	latestVersion, latestValid := parseVersion(latest)
+	if !latestValid {
 		return false
 	}
-	if current == "" || strings.Contains(current, "dev") || strings.Contains(current, "unknown") {
-		return current != latest
+	currentVersion, currentValid := parseVersion(current)
+	if !currentValid {
+		return normalizeVersion(current) != normalizeVersion(latest)
 	}
-	if current == latest {
-		return false
-	}
-	currentParts := splitVersionParts(current)
-	latestParts := splitVersionParts(latest)
-	maxParts := len(currentParts)
-	if len(latestParts) > maxParts {
-		maxParts = len(latestParts)
+	maxParts := len(currentVersion.Parts)
+	if len(latestVersion.Parts) > maxParts {
+		maxParts = len(latestVersion.Parts)
 	}
 	for index := 0; index < maxParts; index++ {
 		currentPart := 0
 		latestPart := 0
-		if index < len(currentParts) {
-			currentPart = currentParts[index]
+		if index < len(currentVersion.Parts) {
+			currentPart = currentVersion.Parts[index]
 		}
-		if index < len(latestParts) {
-			latestPart = latestParts[index]
+		if index < len(latestVersion.Parts) {
+			latestPart = latestVersion.Parts[index]
 		}
 		if latestPart != currentPart {
 			return latestPart > currentPart
 		}
 	}
-	return false
+	return comparePrerelease(latestVersion.Prerelease, currentVersion.Prerelease) > 0
 }
 
 func normalizeVersion(value string) string {
@@ -416,16 +364,84 @@ func normalizeVersion(value string) string {
 	return strings.TrimPrefix(value, "v")
 }
 
-func splitVersionParts(value string) []int {
-	fields := strings.FieldsFunc(value, func(char rune) bool { return char < '0' || char > '9' })
-	parts := make([]int, 0, len(fields))
-	for _, field := range fields {
-		part, err := strconv.Atoi(field)
-		if err == nil {
-			parts = append(parts, part)
+type parsedVersion struct {
+	Parts      []int
+	Prerelease string
+}
+
+func parseVersion(value string) (parsedVersion, bool) {
+	value = normalizeVersion(value)
+	if buildIndex := strings.IndexByte(value, '+'); buildIndex >= 0 {
+		value = value[:buildIndex]
+	}
+	prerelease := ""
+	if prereleaseIndex := strings.IndexByte(value, '-'); prereleaseIndex >= 0 {
+		prerelease = value[prereleaseIndex+1:]
+		value = value[:prereleaseIndex]
+		if prerelease == "" {
+			return parsedVersion{}, false
 		}
 	}
-	return parts
+	fields := strings.Split(value, ".")
+	if len(fields) < 2 {
+		return parsedVersion{}, false
+	}
+	parts := make([]int, 0, len(fields))
+	for _, field := range fields {
+		if field == "" {
+			return parsedVersion{}, false
+		}
+		part, err := strconv.Atoi(field)
+		if err != nil || part < 0 {
+			return parsedVersion{}, false
+		}
+		parts = append(parts, part)
+	}
+	return parsedVersion{Parts: parts, Prerelease: prerelease}, true
+}
+
+func comparePrerelease(left, right string) int {
+	if left == right {
+		return 0
+	}
+	if left == "" {
+		return 1
+	}
+	if right == "" {
+		return -1
+	}
+	leftParts := strings.Split(left, ".")
+	rightParts := strings.Split(right, ".")
+	maxParts := len(leftParts)
+	if len(rightParts) > maxParts {
+		maxParts = len(rightParts)
+	}
+	for index := 0; index < maxParts; index++ {
+		if index >= len(leftParts) {
+			return -1
+		}
+		if index >= len(rightParts) {
+			return 1
+		}
+		leftNumber, leftErr := strconv.Atoi(leftParts[index])
+		rightNumber, rightErr := strconv.Atoi(rightParts[index])
+		switch {
+		case leftErr == nil && rightErr == nil && leftNumber != rightNumber:
+			if leftNumber > rightNumber {
+				return 1
+			}
+			return -1
+		case leftErr == nil && rightErr != nil:
+			return -1
+		case leftErr != nil && rightErr == nil:
+			return 1
+		case leftParts[index] > rightParts[index]:
+			return 1
+		case leftParts[index] < rightParts[index]:
+			return -1
+		}
+	}
+	return 0
 }
 
 func firstNonEmpty(values ...string) string {

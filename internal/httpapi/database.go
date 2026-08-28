@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ func (s *Server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
 		"database":               s.store.DatabaseStatus(),
 		"backup_dir":             s.cfg.DatabaseBackupDir,
+		"backup_retention_count": s.cfg.DatabaseBackupRetentionCount,
 		"message_retention_days": s.cfg.DatabaseMessageRetentionDays,
 	}})
 }
@@ -21,10 +23,12 @@ func (s *Server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleDatabaseBackup(w http.ResponseWriter, _ *http.Request) {
 	path, err := s.createDatabaseBackup()
 	if err != nil {
+		s.cleanupDatabaseBackups()
 		_ = s.store.RecordMaintenance("backup", "failed", err.Error())
 		writeError(w, http.StatusInternalServerError, "database_backup_failed", "创建数据库备份失败："+err.Error())
 		return
 	}
+	s.cleanupDatabaseBackups()
 	_ = s.store.RecordMaintenance("backup", "success", path)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"path": path}})
 }
@@ -92,15 +96,16 @@ func (s *Server) performDatabaseMaintenance() {
 	if checkpointErr := s.store.Checkpoint(); checkpointErr != nil {
 		s.log.Warn("自动合并 SQLite WAL 失败", "错误", checkpointErr)
 	}
-	s.cleanupDatabaseBackups()
 	if backupErr != nil {
+		s.cleanupDatabaseBackups()
 		_ = s.store.RecordMaintenance("automatic", "failed", backupErr.Error())
 		s.log.Warn("自动数据库备份失败", "错误", backupErr)
 		return
 	}
-	detail := fmt.Sprintf("备份=%s，清理过期邮件=%d", backupPath, deleted)
+	s.cleanupDatabaseBackups()
+	detail := fmt.Sprintf("备份=%s，清理过期邮件=%d，最多保留=%d份", backupPath, deleted, s.cfg.DatabaseBackupRetentionCount)
 	_ = s.store.RecordMaintenance("automatic", "success", detail)
-	s.log.Info("数据库自动维护完成", "备份", backupPath, "清理过期邮件", deleted)
+	s.log.Info("数据库自动维护完成", "备份", backupPath, "清理过期邮件", deleted, "最多保留", s.cfg.DatabaseBackupRetentionCount)
 }
 
 func (s *Server) createDatabaseBackup() (string, error) {
@@ -118,18 +123,52 @@ func (s *Server) cleanupDatabaseBackups() {
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().AddDate(0, 0, -s.cfg.DatabaseBackupRetentionDays)
+	type backupPair struct {
+		name    string
+		modTime time.Time
+	}
+	names := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !entry.IsDir() {
+			names[entry.Name()] = true
+		}
+	}
+	backups := make([]backupPair, 0, len(entries)/2)
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "app-") || !strings.HasSuffix(name, ".db") {
 			continue
 		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, "app-") || (!strings.HasSuffix(name, ".db") && !strings.HasSuffix(name, ".db.key")) {
+		if !names[name+".key"] {
+			_ = os.Remove(filepath.Join(dir, name))
 			continue
 		}
 		info, err := entry.Info()
-		if err == nil && info.ModTime().Before(cutoff) {
+		if err == nil {
+			backups = append(backups, backupPair{name: name, modTime: info.ModTime()})
+		}
+	}
+	for name := range names {
+		if strings.HasPrefix(name, "app-") && strings.HasSuffix(name, ".db.key") && !names[strings.TrimSuffix(name, ".key")] {
 			_ = os.Remove(filepath.Join(dir, name))
 		}
+	}
+	sort.Slice(backups, func(i, j int) bool {
+		if backups[i].modTime.Equal(backups[j].modTime) {
+			return backups[i].name > backups[j].name
+		}
+		return backups[i].modTime.After(backups[j].modTime)
+	})
+	retentionCount := s.cfg.DatabaseBackupRetentionCount
+	if retentionCount <= 0 {
+		retentionCount = 3
+	}
+	if len(backups) <= retentionCount {
+		return
+	}
+	for _, backup := range backups[retentionCount:] {
+		path := filepath.Join(dir, backup.name)
+		_ = os.Remove(path)
+		_ = os.Remove(path + ".key")
 	}
 }

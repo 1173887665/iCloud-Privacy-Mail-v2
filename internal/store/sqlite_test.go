@@ -71,6 +71,7 @@ func TestSQLiteEncryptsSensitiveFieldsAndReopens(t *testing.T) {
 	}
 	settings := state.Settings()
 	settings.PublicAPIKey = "public-secret"
+	settings.ServerChanSendKey = "SCT-server-chan-secret"
 	if _, err := state.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +82,12 @@ func TestSQLiteEncryptsSensitiveFieldsAndReopens(t *testing.T) {
 	if bytes.Contains(raw, []byte(mailbox.APIToken)) || !bytes.Contains(raw, []byte(secretPrefix)) {
 		t.Fatalf("邮箱 API Token 未加密：%s", raw)
 	}
+	if err := state.db.QueryRow(`SELECT data_json FROM settings WHERE id = 'system'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(settings.ServerChanSendKey)) || !bytes.Contains(raw, []byte(secretPrefix)) {
+		t.Fatalf("Server 酱 SendKey 未加密：%s", raw)
+	}
 	if err := state.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +97,7 @@ func TestSQLiteEncryptsSensitiveFieldsAndReopens(t *testing.T) {
 	}
 	defer reopened.Close()
 	persisted, ok := reopened.FindMailboxByID(mailbox.ID)
-	if !ok || persisted.APIToken != mailbox.APIToken || reopened.Settings().PublicAPIKey != "public-secret" {
+	if !ok || persisted.APIToken != mailbox.APIToken || reopened.Settings().PublicAPIKey != "public-secret" || reopened.Settings().ServerChanSendKey != "SCT-server-chan-secret" {
 		t.Fatalf("敏感字段解密结果不正确：%+v", persisted)
 	}
 }
