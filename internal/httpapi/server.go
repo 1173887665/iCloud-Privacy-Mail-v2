@@ -123,6 +123,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/mailboxes", s.protected(s.handleMailboxes))
 	s.mux.HandleFunc("POST /api/mailboxes", s.protected(s.handleImportMailbox))
 	s.mux.HandleFunc("POST /api/mailboxes/resolve", s.protected(s.handleMailboxResolve))
+	s.mux.HandleFunc("GET /api/mailboxes/sync-messages/status", s.protected(s.handleExistingMailboxMessagesSyncStatus))
 	s.mux.HandleFunc("POST /api/mailboxes/sync-messages", s.protected(s.handleExistingMailboxMessagesSync))
 	s.mux.HandleFunc("POST /api/mailboxes/remote-clean", s.protected(s.handleMailboxesRemoteClean))
 	s.mux.HandleFunc("GET /api/mailboxes/{id}", s.protected(s.handleMailbox))
@@ -764,12 +765,20 @@ func (s *Server) handleMailboxSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExistingMailboxMessagesSync(w http.ResponseWriter, r *http.Request) {
-	result, err := s.mailbox.SyncExistingMailboxMessages(r.Context())
+	job, err := s.mailbox.StartExistingMailboxMessageSync(s.runtimeCtx)
 	if err != nil {
+		if strings.Contains(err.Error(), "正在运行") {
+			writeError(w, http.StatusConflict, "mailbox_message_sync_running", err.Error())
+			return
+		}
 		writeServiceError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": result})
+	writeJSON(w, http.StatusAccepted, map[string]any{"success": true, "data": map[string]any{"job": job}})
+}
+
+func (s *Server) handleExistingMailboxMessagesSyncStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"job": s.mailbox.ExistingMailboxMessageSyncStatus()}})
 }
 
 func (s *Server) handleImportMailbox(w http.ResponseWriter, r *http.Request) {

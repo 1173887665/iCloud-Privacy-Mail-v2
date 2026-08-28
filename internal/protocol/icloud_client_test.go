@@ -33,18 +33,36 @@ func TestMailHeaderValueReadsFoldedMessageID(t *testing.T) {
 	}
 }
 
-func TestMailThreadSearchLimitUsesFolderCountForFullScan(t *testing.T) {
+func TestMailThreadSearchLimitUsesWebValidatedBoundForFullScan(t *testing.T) {
 	options := MailSyncOptions{FullScan: true, Limit: 20}
-	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 738}, options); limit != 738 {
-		t.Fatalf("全量 Web 同步仍被固定条数截断：%d", limit)
+	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 738}, options); limit != 1000 {
+		t.Fatalf("全量 Web 同步上限不正确：%d", limit)
 	}
-	if limit := mailThreadSearchLimit(mailFolder{}, options); limit <= 50 {
-		t.Fatalf("缺少文件夹计数时不应退回最近 50 封：%d", limit)
+	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 5000}, options); limit != 1000 {
+		t.Fatalf("全量 Web 同步不应直接使用文件夹邮件数：%d", limit)
 	}
 }
 
 func TestMailThreadSearchLimitKeepsIncrementalBound(t *testing.T) {
 	if limit := mailThreadSearchLimit(mailFolder{MessageCount: 738}, MailSyncOptions{Limit: 20}); limit != 20 {
 		t.Fatalf("增量同步限制不正确：%d", limit)
+	}
+}
+
+func TestMailThreadSearchBodyUsesBrowserFullScanMode(t *testing.T) {
+	body := mailThreadSearchBody(mailFolder{Name: "INBOX", MessageCount: 53}, 1000, true)
+	if body["responseType"] != "THREAD_ID_AND_DATE" || body["includeFolderStatus"] != true || body["maxResults"] != 1000 {
+		t.Fatalf("全量 Web 检索请求体不正确：%+v", body)
+	}
+	headers, ok := body["sessionHeaders"].(map[string]any)
+	if !ok || headers["folder"] != "INBOX" || headers["modseq"] != nil || headers["threadmodseq"] != nil {
+		t.Fatalf("首次全量 Web 检索的会话头不正确：%+v", body["sessionHeaders"])
+	}
+}
+
+func TestMailThreadSearchBodyKeepsDigestModeForIncrementalSync(t *testing.T) {
+	body := mailThreadSearchBody(mailFolder{Name: "INBOX"}, 20, false)
+	if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != false || body["maxResults"] != 20 {
+		t.Fatalf("增量 Web 检索请求体不正确：%+v", body)
 	}
 }

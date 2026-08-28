@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.1.0",
-    "name": "2.1.0 源码版",
-    "notes": "新增 Apple 主号级 IMAP 与 iCloud Web 双路径读信、全量历史邮件同步、全站统一悬浮提示、Server 酱通知和按数量保留的 SQLite 自动备份。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "version": "2.1.1",
+    "name": "2.1.1 源码版",
+    "notes": "修复 iCloud Web 全量补查的请求参数校验错误，邮件同步改为后台队列并实时显示进度。请重新下载最新源代码，并按照 README 重新构建和启动。",
     "published_at": "2026-08-29T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-1-1",
+      "type": "update",
+      "title": "2.1.1 邮件同步修复已更新",
+      "summary": "iCloud Web 全量请求、后台队列和同步进度提示已修复。",
+      "content": "全量 Web 补查现在使用 iCloud 网页端的 THREAD_ID_AND_DATE 模式和固定 1000 条窗口，不再把文件夹邮件数直接填入 maxResults。同步已有邮箱邮件改为后台任务，页面会先短暂显示启动说明，再持续更新完成、执行、排队、IMAP、Web API、扫描、匹配和新增数量。",
+      "published_at": "2026-08-29T02:00:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-1-0",
       "type": "update",

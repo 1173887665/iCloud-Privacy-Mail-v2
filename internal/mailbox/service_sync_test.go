@@ -231,6 +231,25 @@ func TestManualMailboxSyncReportsWebComplementFailure(t *testing.T) {
 	}
 }
 
+func TestBulkMailboxSyncKeepsIMAPSuccessWhenWebComplementFails(t *testing.T) {
+	state := openSyncTestStore(t)
+	saveSyncTestAccount(t, state, "bulk-partial@icloud.com", true)
+	backend := &fakeMessageSyncBackend{
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, Scanned: 12},
+		webErr:     errors.New("Web 补查测试故障"),
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	result, err := service.SyncExistingMailboxMessages(context.Background())
+	if err != nil || result.SuccessfulAccounts != 1 || result.FailedAccounts != 0 || result.IMAPAccounts != 1 {
+		t.Fatalf("IMAP 已完成时不应把批量账号计为失败：结果=%+v，错误=%v", result, err)
+	}
+	if !strings.Contains(result.Accounts[0].FallbackReason, "Web 补查测试故障") {
+		t.Fatalf("Web 补查路径提示缺失：%+v", result.Accounts[0])
+	}
+}
+
 func TestSyncExistingMailboxMessagesFallsBackToWeb(t *testing.T) {
 	state := openSyncTestStore(t)
 	saveSyncTestAccount(t, state, "fallback@icloud.com", true)
@@ -330,6 +349,42 @@ func TestSyncExistingMailboxMessagesLimitsAccountConcurrency(t *testing.T) {
 	_, web, maxActive := backend.counts()
 	if web != 5 || maxActive < 2 || maxActive > 3 {
 		t.Fatalf("账号级并发应在 2 到 3 之间：Web=%d，最大并发=%d", web, maxActive)
+	}
+}
+
+func TestExistingMailboxMessageSyncJobPublishesAccountProgress(t *testing.T) {
+	state := openSyncTestStore(t)
+	for index := 0; index < 2; index++ {
+		saveSyncTestAccount(t, state, fmt.Sprintf("job-%d@icloud.com", index), false)
+	}
+	backend := &fakeMessageSyncBackend{delay: 20 * time.Millisecond, webResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, Scanned: 4}}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	started, err := service.StartExistingMailboxMessageSync(context.Background())
+	if err != nil || !started.Running || started.TotalAccounts != 2 || started.Queued != 2 {
+		t.Fatalf("后台邮件同步任务启动失败：任务=%+v，错误=%v", started, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		job := service.ExistingMailboxMessageSyncStatus()
+		if !job.Running {
+			if job.Status != "completed" || job.CompletedAccounts != 2 || job.SuccessfulAccounts != 2 || job.FailedAccounts != 0 || job.WebAPIAccounts != 2 || job.Scanned != 8 {
+				t.Fatalf("后台邮件同步任务结果不正确：%+v", job)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待后台邮件同步任务超时：%+v", job)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestSummarizeExistingMailboxMessageSyncErrorRemovesLongResponse(t *testing.T) {
+	message := `iCloud 邮件 /mailws2/v1/thread/search HTTP 400：{"status":400,"message":"Validation failed for argument at index 0"}`
+	if summary := summarizeExistingMailboxMessageSyncError(message); summary != "iCloud Web 补查请求参数被拒绝（HTTP 400）" {
+		t.Fatalf("邮件同步错误摘要不正确：%s", summary)
 	}
 }
 

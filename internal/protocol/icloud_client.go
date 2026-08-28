@@ -1425,11 +1425,11 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 	seenThreads := make(map[string]bool)
 	for _, folder := range folders {
 		maxThreads := mailThreadSearchLimit(folder, options)
-		threads, err := c.searchThreads(ctx, session, folder, maxThreads)
+		threads, err := c.searchThreadsWithOptions(ctx, session, folder, maxThreads, options.FullScan)
 		if err != nil {
 			return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out)}, err
 		}
-		if !options.FullScan && len(threads) >= maxThreads {
+		if len(threads) >= maxThreads {
 			hasMore = true
 		}
 		for _, thread := range threads {
@@ -1465,12 +1465,9 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 
 func mailThreadSearchLimit(folder mailFolder, options MailSyncOptions) int {
 	if options.FullScan {
-		// 文件夹的邮件数一定不小于会话线程数，用它作为 maxResults 可在一次账号级请求中完整拉取。
-		if folder.MessageCount > 0 {
-			return folder.MessageCount
-		}
-		// iCloud 偶尔会对虚拟 INBOX 省略计数；使用足够大的请求值，避免再次退化为固定 20/50 条。
-		return 100000
+		// iCloud 网页端在 THREAD_ID_AND_DATE 模式下使用固定上限 1000。
+		// 不把文件夹邮件数直接填入 maxResults，否则会触发参数组合校验。
+		return 1000
 	}
 	limit := options.Limit
 	if limit <= 0 || limit > 50 {
@@ -1645,6 +1642,10 @@ func preferredMailFolders(folders []mailFolder) []mailFolder {
 }
 
 func (c *ICloudClient) searchThreads(ctx context.Context, session ICloudSession, folder mailFolder, maxThreads int) ([]mailThread, error) {
+	return c.searchThreadsWithOptions(ctx, session, folder, maxThreads, false)
+}
+
+func (c *ICloudClient) searchThreadsWithOptions(ctx context.Context, session ICloudSession, folder mailFolder, maxThreads int, fullScan bool) ([]mailThread, error) {
 	var out struct {
 		ThreadList []struct {
 			ThreadID  string          `json:"threadId"`
@@ -1653,12 +1654,7 @@ func (c *ICloudClient) searchThreads(ctx context.Context, session ICloudSession,
 			Timestamp json.RawMessage `json:"timestamp"`
 		} `json:"threadList"`
 	}
-	body := map[string]any{
-		"responseType":        "THREAD_DIGEST",
-		"includeFolderStatus": false,
-		"maxResults":          maxThreads,
-		"sessionHeaders":      mailSessionHeaders(folder.Name, false),
-	}
+	body := mailThreadSearchBody(folder, maxThreads, fullScan)
 	if err := c.callMail(ctx, session, "/mailws2/v1/thread/search", body, "", &out); err != nil {
 		return nil, err
 	}
@@ -1672,6 +1668,22 @@ func (c *ICloudClient) searchThreads(ctx context.Context, session ICloudSession,
 		})
 	}
 	return threads, nil
+}
+
+func mailThreadSearchBody(folder mailFolder, maxThreads int, fullScan bool) map[string]any {
+	responseType := "THREAD_DIGEST"
+	includeFolderStatus := false
+	if fullScan {
+		// 与 iCloud 网页端的大批量线程检索请求保持一致。
+		responseType = "THREAD_ID_AND_DATE"
+		includeFolderStatus = true
+	}
+	return map[string]any{
+		"responseType":        responseType,
+		"includeFolderStatus": includeFolderStatus,
+		"maxResults":          maxThreads,
+		"sessionHeaders":      mailSessionHeaders(folder.Name, false),
+	}
 }
 
 func (c *ICloudClient) threadMessages(ctx context.Context, session ICloudSession, folder mailFolder, threadID, alias string, after time.Time) ([]ICloudSyncedMessage, error) {

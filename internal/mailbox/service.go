@@ -17,19 +17,22 @@ import (
 )
 
 type Service struct {
-	cfg               config.Config
-	store             *store.Store
-	client            *protocol.ICloudClient
-	messageBackend    messageSyncBackend
-	deleteClient      remoteMailboxDeleteClient
-	createMu          sync.Mutex
-	syncMu            sync.Mutex
-	syncs             map[string]*syncCall
-	cleanupMu         sync.Mutex
-	cleanupState      AppleMailCleanupJob
-	cleanupMailboxes  map[string]int
-	cleanupCancel     context.CancelFunc
-	cleanupGeneration uint64
+	cfg                      config.Config
+	store                    *store.Store
+	client                   *protocol.ICloudClient
+	messageBackend           messageSyncBackend
+	deleteClient             remoteMailboxDeleteClient
+	createMu                 sync.Mutex
+	syncMu                   sync.Mutex
+	syncs                    map[string]*syncCall
+	cleanupMu                sync.Mutex
+	cleanupState             AppleMailCleanupJob
+	cleanupMailboxes         map[string]int
+	cleanupCancel            context.CancelFunc
+	cleanupGeneration        uint64
+	messageSyncJobMu         sync.Mutex
+	messageSyncJob           ExistingMailboxMessageSyncJob
+	messageSyncJobGeneration uint64
 }
 
 type remoteMailboxDeleteClient interface {
@@ -150,6 +153,39 @@ type ExistingMailboxMessageSyncResult struct {
 	Failures           []ExistingMailboxMessageSyncFailure `json:"failures,omitempty"`
 }
 
+type ExistingMailboxMessageSyncJob struct {
+	ID                 string                              `json:"id,omitempty"`
+	Running            bool                                `json:"running"`
+	Status             string                              `json:"status"`
+	Stage              string                              `json:"stage,omitempty"`
+	TotalAccounts      int                                 `json:"total_accounts"`
+	TotalMailboxes     int                                 `json:"total_mailboxes"`
+	SkippedMailboxes   int                                 `json:"skipped_mailboxes"`
+	Queued             int                                 `json:"queued"`
+	Active             int                                 `json:"active"`
+	CompletedAccounts  int                                 `json:"completed_accounts"`
+	SuccessfulAccounts int                                 `json:"successful_accounts"`
+	FailedAccounts     int                                 `json:"failed_accounts"`
+	SyncedMessages     int                                 `json:"synced_messages"`
+	Scanned            int                                 `json:"scanned"`
+	Matched            int                                 `json:"matched"`
+	IMAPAccounts       int                                 `json:"imap_accounts"`
+	WebAPIAccounts     int                                 `json:"web_api_accounts"`
+	Fallbacks          int                                 `json:"fallbacks"`
+	HasMore            bool                                `json:"has_more"`
+	LastError          string                              `json:"last_error,omitempty"`
+	Failures           []ExistingMailboxMessageSyncFailure `json:"failures,omitempty"`
+	StartedAt          time.Time                           `json:"started_at,omitempty"`
+	UpdatedAt          time.Time                           `json:"updated_at,omitempty"`
+	CompletedAt        time.Time                           `json:"completed_at,omitempty"`
+}
+
+type existingMailboxMessageSyncTarget struct {
+	index     int
+	accountID string
+	mailboxes []domain.Mailbox
+}
+
 type CodeQuery struct {
 	After         time.Time
 	Keyword       string
@@ -223,10 +259,11 @@ type AppleMailCleanupJob struct {
 }
 
 const appleMailCleanupStateID = "apple-mail-cleanup"
+const existingMailboxMessageSyncStateID = "mailbox-message-sync"
 
 func NewService(cfg config.Config, state *store.Store) *Service {
 	client := protocol.NewICloudClient()
-	service := &Service{cfg: cfg, store: state, client: client, messageBackend: defaultMessageSyncBackend{client: client}, deleteClient: client, syncs: make(map[string]*syncCall), cleanupState: AppleMailCleanupJob{Status: "idle"}, cleanupMailboxes: make(map[string]int)}
+	service := &Service{cfg: cfg, store: state, client: client, messageBackend: defaultMessageSyncBackend{client: client}, deleteClient: client, syncs: make(map[string]*syncCall), cleanupState: AppleMailCleanupJob{Status: "idle"}, cleanupMailboxes: make(map[string]int), messageSyncJob: ExistingMailboxMessageSyncJob{Status: "idle"}}
 	if state != nil {
 		var persisted AppleMailCleanupJob
 		if found, err := state.LoadRuntimeState(appleMailCleanupStateID, &persisted); err == nil && found {
@@ -240,6 +277,21 @@ func NewService(cfg config.Config, state *store.Store) *Service {
 				service.cleanupState.UpdatedAt = time.Now()
 				service.cleanupState.CompletedAt = time.Now()
 				_ = state.SaveRuntimeState(appleMailCleanupStateID, service.cleanupState, true)
+			}
+		}
+		var persistedSync ExistingMailboxMessageSyncJob
+		if found, err := state.LoadRuntimeState(existingMailboxMessageSyncStateID, &persistedSync); err == nil && found {
+			service.messageSyncJob = persistedSync
+			if service.messageSyncJob.Running {
+				service.messageSyncJob.Running = false
+				service.messageSyncJob.Status = "interrupted"
+				service.messageSyncJob.Stage = "interrupted"
+				service.messageSyncJob.Active = 0
+				service.messageSyncJob.Queued = 0
+				service.messageSyncJob.LastError = "服务重启，未完成的邮件同步任务已停止，请重新执行"
+				service.messageSyncJob.UpdatedAt = time.Now()
+				service.messageSyncJob.CompletedAt = time.Now()
+				_ = state.SaveRuntimeState(existingMailboxMessageSyncStateID, service.messageSyncJob, true)
 			}
 		}
 	}
@@ -844,33 +896,95 @@ func (s *Service) syncMailboxMessagesWithOptions(ctx context.Context, mailboxID 
 
 // SyncExistingMailboxMessages 每个 Apple 主账号只拉取一次收件箱，再在本地把邮件分发到对应隐私邮箱。
 func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMailboxMessageSyncResult, error) {
+	return s.syncExistingMailboxMessages(ctx, nil, nil)
+}
+
+// StartExistingMailboxMessageSync 在后台启动全部已有邮箱的邮件同步任务。
+func (s *Service) StartExistingMailboxMessageSync(parent context.Context) (ExistingMailboxMessageSyncJob, error) {
+	targets, totalMailboxes, skippedMailboxes := s.existingMailboxMessageSyncTargets()
+	if parent == nil {
+		parent = context.Background()
+	}
+
+	s.messageSyncJobMu.Lock()
+	defer s.messageSyncJobMu.Unlock()
+	if s.messageSyncJob.Running {
+		return ExistingMailboxMessageSyncJob{}, errors.New("邮件同步任务正在运行")
+	}
+	s.messageSyncJobGeneration++
+	generation := s.messageSyncJobGeneration
+	now := time.Now()
+	s.messageSyncJob = ExistingMailboxMessageSyncJob{
+		ID:               fmt.Sprintf("mailbox_message_sync_%d", now.UnixNano()),
+		Running:          true,
+		Status:           "queued",
+		Stage:            "queued",
+		TotalAccounts:    len(targets),
+		TotalMailboxes:   totalMailboxes,
+		SkippedMailboxes: skippedMailboxes,
+		Queued:           len(targets),
+		Failures:         []ExistingMailboxMessageSyncFailure{},
+		StartedAt:        now,
+		UpdatedAt:        now,
+	}
+	s.publishExistingMailboxMessageSyncLocked()
+	out := s.existingMailboxMessageSyncSnapshotLocked()
+	go s.runExistingMailboxMessageSync(parent, generation, targets, totalMailboxes, skippedMailboxes)
+	return out, nil
+}
+
+// ExistingMailboxMessageSyncStatus 返回后台邮件同步任务的当前快照。
+func (s *Service) ExistingMailboxMessageSyncStatus() ExistingMailboxMessageSyncJob {
+	s.messageSyncJobMu.Lock()
+	defer s.messageSyncJobMu.Unlock()
+	return s.existingMailboxMessageSyncSnapshotLocked()
+}
+
+func (s *Service) runExistingMailboxMessageSync(ctx context.Context, generation uint64, targets []existingMailboxMessageSyncTarget, totalMailboxes, skippedMailboxes int) {
+	result, err := s.syncExistingMailboxMessageTargets(ctx, targets, totalMailboxes, skippedMailboxes,
+		func(accountID string) { s.beginExistingMailboxMessageSyncAccount(generation, accountID) },
+		func(account AccountMessageSyncResult) { s.finishExistingMailboxMessageSyncAccount(generation, account) },
+	)
+	s.finishExistingMailboxMessageSyncJob(generation, result, err)
+}
+
+func (s *Service) existingMailboxMessageSyncTargets() ([]existingMailboxMessageSyncTarget, int, int) {
 	allMailboxes := s.store.AllMailboxes()
-	result := ExistingMailboxMessageSyncResult{}
 	groups := make(map[string][]domain.Mailbox)
 	order := make([]string, 0)
+	totalMailboxes := 0
+	skippedMailboxes := 0
 	for _, mailbox := range allMailboxes {
 		accountID := strings.TrimSpace(mailbox.AccountID)
 		if accountID == "" || strings.TrimSpace(mailbox.Email) == "" {
-			result.SkippedMailboxes++
+			skippedMailboxes++
 			continue
 		}
 		if _, exists := groups[accountID]; !exists {
 			order = append(order, accountID)
 		}
 		groups[accountID] = append(groups[accountID], mailbox)
-		result.TotalMailboxes++
+		totalMailboxes++
 	}
-	result.TotalAccounts = len(order)
-	type syncJob struct {
-		index     int
-		accountID string
-		mailboxes []domain.Mailbox
+	targets := make([]existingMailboxMessageSyncTarget, 0, len(order))
+	for index, accountID := range order {
+		targets = append(targets, existingMailboxMessageSyncTarget{index: index, accountID: accountID, mailboxes: groups[accountID]})
 	}
-	accountResults := make([]AccountMessageSyncResult, len(order))
-	jobs := make(chan syncJob)
+	return targets, totalMailboxes, skippedMailboxes
+}
+
+func (s *Service) syncExistingMailboxMessages(ctx context.Context, onStart func(string), onFinish func(AccountMessageSyncResult)) (ExistingMailboxMessageSyncResult, error) {
+	targets, totalMailboxes, skippedMailboxes := s.existingMailboxMessageSyncTargets()
+	return s.syncExistingMailboxMessageTargets(ctx, targets, totalMailboxes, skippedMailboxes, onStart, onFinish)
+}
+
+func (s *Service) syncExistingMailboxMessageTargets(ctx context.Context, targets []existingMailboxMessageSyncTarget, totalMailboxes, skippedMailboxes int, onStart func(string), onFinish func(AccountMessageSyncResult)) (ExistingMailboxMessageSyncResult, error) {
+	result := ExistingMailboxMessageSyncResult{TotalAccounts: len(targets), TotalMailboxes: totalMailboxes, SkippedMailboxes: skippedMailboxes}
+	accountResults := make([]AccountMessageSyncResult, len(targets))
+	jobs := make(chan existingMailboxMessageSyncTarget)
 	workerCount := 3
-	if len(order) < workerCount {
-		workerCount = len(order)
+	if len(targets) < workerCount {
+		workerCount = len(targets)
 	}
 	var workers sync.WaitGroup
 	for worker := 0; worker < workerCount; worker++ {
@@ -878,6 +992,9 @@ func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMail
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
+				if onStart != nil {
+					onStart(job.accountID)
+				}
 				accountResult, syncErr := s.syncGroup(ctx, job.accountID, job.mailboxes, MessageSyncOptions{
 					Mode: protocol.MailSyncModeAllRecent, Trigger: "bulk-manual",
 					FullScan: true, UseCursor: false, AllowFallback: true, UseWebComplement: true,
@@ -886,14 +1003,20 @@ func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMail
 					accountResult.Error = syncErr.Error()
 				}
 				accountResults[job.index] = accountResult
+				if onFinish != nil {
+					onFinish(accountResult)
+				}
 			}
 		}()
 	}
-	for index, accountID := range order {
-		if ctx.Err() != nil {
-			break
+	for _, job := range targets {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return result, ctx.Err()
+		case jobs <- job:
 		}
-		jobs <- syncJob{index: index, accountID: accountID, mailboxes: groups[accountID]}
 	}
 	close(jobs)
 	workers.Wait()
@@ -931,6 +1054,131 @@ func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMail
 		return result, err
 	}
 	return result, nil
+}
+
+func (s *Service) beginExistingMailboxMessageSyncAccount(generation uint64, _ string) {
+	s.messageSyncJobMu.Lock()
+	defer s.messageSyncJobMu.Unlock()
+	if generation != s.messageSyncJobGeneration || !s.messageSyncJob.Running {
+		return
+	}
+	s.messageSyncJob.Status = "running"
+	s.messageSyncJob.Stage = "syncing"
+	s.messageSyncJob.Active++
+	if s.messageSyncJob.Queued > 0 {
+		s.messageSyncJob.Queued--
+	}
+	s.messageSyncJob.UpdatedAt = time.Now()
+	s.publishExistingMailboxMessageSyncLocked()
+}
+
+func (s *Service) finishExistingMailboxMessageSyncAccount(generation uint64, account AccountMessageSyncResult) {
+	s.messageSyncJobMu.Lock()
+	defer s.messageSyncJobMu.Unlock()
+	if generation != s.messageSyncJobGeneration || !s.messageSyncJob.Running {
+		return
+	}
+	if s.messageSyncJob.Active > 0 {
+		s.messageSyncJob.Active--
+	}
+	s.messageSyncJob.CompletedAccounts++
+	s.messageSyncJob.SyncedMessages += account.SyncedMessages
+	s.messageSyncJob.Scanned += account.Scanned
+	s.messageSyncJob.Matched += account.Matched
+	s.messageSyncJob.HasMore = s.messageSyncJob.HasMore || account.HasMore
+	if account.FallbackUsed {
+		s.messageSyncJob.Fallbacks++
+	}
+	s.addExistingMailboxMessageSyncMethodLocked(account.Method)
+	if account.Error == "" {
+		s.messageSyncJob.SuccessfulAccounts++
+		s.messageSyncJob.Stage = "account-completed"
+	} else {
+		s.messageSyncJob.FailedAccounts++
+		summary := summarizeExistingMailboxMessageSyncError(account.Error)
+		s.messageSyncJob.LastError = summary
+		s.messageSyncJob.Failures = append(s.messageSyncJob.Failures, ExistingMailboxMessageSyncFailure{
+			AccountID: account.AccountID, Account: account.Account, Mailboxes: account.Mailboxes, Error: summary,
+		})
+		s.messageSyncJob.Stage = "account-failed"
+	}
+	s.messageSyncJob.UpdatedAt = time.Now()
+	s.publishExistingMailboxMessageSyncLocked()
+}
+
+func (s *Service) addExistingMailboxMessageSyncMethodLocked(method string) {
+	switch method {
+	case "imap":
+		s.messageSyncJob.IMAPAccounts++
+	case "web_api":
+		s.messageSyncJob.WebAPIAccounts++
+	case "imap_web":
+		s.messageSyncJob.IMAPAccounts++
+		s.messageSyncJob.WebAPIAccounts++
+	}
+}
+
+func (s *Service) finishExistingMailboxMessageSyncJob(generation uint64, result ExistingMailboxMessageSyncResult, runErr error) {
+	s.messageSyncJobMu.Lock()
+	defer s.messageSyncJobMu.Unlock()
+	if generation != s.messageSyncJobGeneration || !s.messageSyncJob.Running {
+		return
+	}
+	now := time.Now()
+	s.messageSyncJob.Running = false
+	s.messageSyncJob.Active = 0
+	s.messageSyncJob.Queued = 0
+	s.messageSyncJob.TotalAccounts = result.TotalAccounts
+	s.messageSyncJob.TotalMailboxes = result.TotalMailboxes
+	s.messageSyncJob.SkippedMailboxes = result.SkippedMailboxes
+	s.messageSyncJob.CompletedAt = now
+	s.messageSyncJob.UpdatedAt = now
+	if runErr != nil {
+		s.messageSyncJob.Status = "interrupted"
+		s.messageSyncJob.Stage = "interrupted"
+		s.messageSyncJob.LastError = summarizeExistingMailboxMessageSyncError(runErr.Error())
+	} else if s.messageSyncJob.FailedAccounts > 0 {
+		s.messageSyncJob.Status = "partial"
+		s.messageSyncJob.Stage = "partial"
+	} else {
+		s.messageSyncJob.Status = "completed"
+		s.messageSyncJob.Stage = "completed"
+		s.messageSyncJob.LastError = ""
+	}
+	s.publishExistingMailboxMessageSyncLocked()
+}
+
+func (s *Service) publishExistingMailboxMessageSyncLocked() {
+	if s.store != nil {
+		_ = s.store.SaveRuntimeState(existingMailboxMessageSyncStateID, s.messageSyncJob, true)
+	}
+}
+
+func (s *Service) existingMailboxMessageSyncSnapshotLocked() ExistingMailboxMessageSyncJob {
+	out := s.messageSyncJob
+	out.Failures = append([]ExistingMailboxMessageSyncFailure(nil), s.messageSyncJob.Failures...)
+	return out
+}
+
+func summarizeExistingMailboxMessageSyncError(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "邮件同步失败"
+	}
+	if strings.Contains(message, "/mailws2/v1/thread/search HTTP 400") {
+		return "iCloud Web 补查请求参数被拒绝（HTTP 400）"
+	}
+	for _, marker := range []string{"：{", ": {", "\n"} {
+		if index := strings.Index(message, marker); index > 0 {
+			message = strings.TrimSpace(message[:index])
+			break
+		}
+	}
+	runes := []rune(message)
+	if len(runes) > 160 {
+		message = string(runes[:160]) + "…"
+	}
+	return message
 }
 
 // SyncMailboxBatch 按 Apple 账号批量拉取一次收件箱，再把邮件分发给对应隐私邮箱。
@@ -1070,7 +1318,8 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 			source = ""
 		} else {
 			accountResult.FallbackReason = "IMAP 已完成，但 iCloud Web 补查失败：" + webErr.Error()
-			if options.FullScan || options.Trigger == "manual" {
+			// 全量批量同步中，IMAP 已成功拉取全部邮件时，Web 补查失败只作为路径提示，不把整个账号计为失败。
+			if options.Trigger == "manual" {
 				complementErr = errors.New(accountResult.FallbackReason)
 			}
 		}
