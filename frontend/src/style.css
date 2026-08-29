@@ -4059,7 +4059,10 @@ textarea.field {
 }
 
 .task-event-account {
+  display: inline-block;
+  max-width: 100%;
   text-align: left;
+  vertical-align: middle;
 }
 
 .mailbox-account-cell {

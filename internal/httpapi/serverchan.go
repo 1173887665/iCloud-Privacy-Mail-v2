@@ -147,7 +147,7 @@ func (s *Server) notifyOfflineTransitions(settings domain.Settings, previous, cu
 		if len(parts) != 2 {
 			continue
 		}
-		line := fmt.Sprintf("- %s：%s", loginStateDisplayName(parts[1]), firstNonEmptyText(after.Message, "登录态检测失败"))
+		line := fmt.Sprintf("  - %s：%s", loginStateDisplayName(parts[1]), firstNonEmptyText(after.Message, "登录态检测失败"))
 		byAccount[parts[0]] = append(byAccount[parts[0]], line)
 	}
 	if len(byAccount) == 0 {
@@ -162,14 +162,21 @@ func (s *Server) notifyOfflineTransitions(settings domain.Settings, previous, cu
 		accountIDs = append(accountIDs, accountID)
 	}
 	sort.Strings(accountIDs)
+	incidentSections := make([]string, 0, len(accountIDs))
 	for _, accountID := range accountIDs {
 		label := labels[accountID]
-		s.sendServerChanAsync(settings, serverchan.Message{
-			Title: "Apple 账号登录态掉线",
-			Desp:  fmt.Sprintf("检测到 Apple 账号的登录态从正常转为异常。\n\n- 账号：%s\n- 时间：%s\n%s\n\n请在后台的 Apple 账号详情中重新检测或登录。", label, time.Now().Format("2006-01-02 15:04:05"), strings.Join(byAccount[accountID], "\n")),
-			Short: fmt.Sprintf("账号 %s 登录态异常", label),
-		})
+		incidentSections = append(incidentSections, fmt.Sprintf("- 掉线账号：%s\n%s", label, strings.Join(byAccount[accountID], "\n")))
 	}
+	primaryLabel := labels[accountIDs[0]]
+	title := fmt.Sprintf("%s｜Apple 登录态掉线", primaryLabel)
+	if len(accountIDs) > 1 {
+		title = fmt.Sprintf("%s 等账号｜Apple 登录态掉线", primaryLabel)
+	}
+	s.sendServerChanAsync(settings, serverchan.Message{
+		Title: title,
+		Desp:  fmt.Sprintf("检测到以下 Apple 账号的登录态从正常转为异常。\n\n%s\n\n- 时间：%s\n\n请在后台的 Apple 账号详情中重新检测或登录。", strings.Join(incidentSections, "\n"), time.Now().Format("2006-01-02 15:04:05")),
+		Short: title,
+	})
 }
 
 func loginStateHealthSnapshot(sessions []domain.ICloudSession) map[string]loginStateHealth {

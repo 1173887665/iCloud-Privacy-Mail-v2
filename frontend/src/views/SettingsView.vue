@@ -291,7 +291,7 @@ onBeforeUnmount(() => {
               </label>
               <div class="server-chan-options">
                 <label class="server-chan-option"><span class="server-chan-option-icon"><LogIn :size="16" /></span><span class="server-chan-option-copy"><strong>后台登录通知</strong><small>管理员成功登录后推送账号、时间、访问地址和浏览器信息。</small></span><input v-model="form.notify_admin_login" class="detail-switch" type="checkbox" /></label>
-                <label class="server-chan-option"><span class="server-chan-option-icon"><WifiOff :size="16" /></span><span class="server-chan-option-copy"><strong>账号与登录态掉线通知</strong><small>Apple Account、iCloud Web 或 IMAP 由正常转为异常时推送，同一掉线状态不重复发送。</small></span><input v-model="form.notify_account_login_state_offline" class="detail-switch" type="checkbox" /></label>
+                <label class="server-chan-option"><span class="server-chan-option-icon"><WifiOff :size="16" /></span><span class="server-chan-option-copy"><strong>账号与登录态掉线通知</strong><small>Apple Account、iCloud Web 或 IMAP 由正常转为异常时推送，标题会显示具体 Apple 账号；发送额度由填写的 SendKey 套餐决定，本地不限制条数。</small></span><input v-model="form.notify_account_login_state_offline" class="detail-switch" type="checkbox" /></label>
                 <label class="server-chan-option"><span class="server-chan-option-icon"><ShieldCheck :size="16" /></span><span class="server-chan-option-copy"><strong>隐藏调用 IP</strong><small>向 Server 酱提交 <code>noip=1</code>，消息中不显示本服务的外网调用 IP。</small></span><input v-model="form.server_chan_hide_ip" class="detail-switch" type="checkbox" /></label>
               </div>
             </div>

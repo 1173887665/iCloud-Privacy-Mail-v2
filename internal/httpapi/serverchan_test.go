@@ -157,8 +157,45 @@ func TestAdminLoginAndOfflineTransitionsSendNotifications(t *testing.T) {
 		[]domain.ICloudSession{{AccountID: "acc-1", AppleID: "notify@example.com"}},
 	)
 	offlineCall := waitForServerChanCall(t, fake.calls)
-	if !strings.Contains(offlineCall.Message.Title, "掉线") || !strings.Contains(offlineCall.Message.Desp, "notify@example.com") || !strings.Contains(offlineCall.Message.Desp, "IMAP 取码") {
+	if offlineCall.Message.Title != "notify@example.com｜Apple 登录态掉线" || strings.Contains(offlineCall.Message.Title, "/") || !strings.Contains(offlineCall.Message.Desp, "掉线账号：notify@example.com") || !strings.Contains(offlineCall.Message.Desp, "IMAP 取码") {
 		t.Fatalf("掉线通知不正确：%+v", offlineCall.Message)
+	}
+}
+
+func TestOfflineTransitionsMergeMultipleAccountsWithoutTotalCount(t *testing.T) {
+	server, state := newServerChanTestFixture(t)
+	settings := state.Settings()
+	settings.ServerChanSendKey = "SCT-paid-or-free-key"
+	settings.NotifyAccountLoginStateOffline = true
+	fake := &fakeServerChanSender{calls: make(chan serverChanCall, 2)}
+	server.serverChan = fake
+
+	checkedAt := time.Now()
+	imapKey := "acc-1\x00" + domain.LoginStateICloudIMAP
+	appleKey := "acc-2\x00" + domain.LoginStateAppleAccount
+	server.notifyOfflineTransitions(settings,
+		map[string]loginStateHealth{
+			imapKey:  {CheckedAt: checkedAt.Add(-time.Minute), OK: true},
+			appleKey: {CheckedAt: checkedAt.Add(-time.Minute), OK: true},
+		},
+		map[string]loginStateHealth{
+			imapKey:  {CheckedAt: checkedAt, OK: false, Message: "IMAP 密码失效"},
+			appleKey: {CheckedAt: checkedAt, OK: false, Message: "Apple 会话失效"},
+		},
+		[]domain.ICloudSession{
+			{AccountID: "acc-1", AppleID: "first@example.com"},
+			{AccountID: "acc-2", AppleID: "second@example.com"},
+		},
+	)
+
+	call := waitForServerChanCall(t, fake.calls)
+	if call.Options.SendKey != "SCT-paid-or-free-key" || strings.Contains(call.Message.Title, "/") || !strings.Contains(call.Message.Title, "first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：second@example.com") {
+		t.Fatalf("多账号掉线合并通知不正确：%+v", call)
+	}
+	select {
+	case extra := <-fake.calls:
+		t.Fatalf("同一轮多账号掉线不应拆成多条推送：%+v", extra)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
