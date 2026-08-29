@@ -97,6 +97,23 @@ func TestPublicMailboxLeaseEmailCompatibilityAndNote(t *testing.T) {
 	if !ok || stored.Status != domain.StatusAvailable || stored.Note != "注册失败，归还邮箱" {
 		t.Fatalf("兼容释放结果不正确：%+v，存在=%t", stored, ok)
 	}
+
+	regularCommit := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(leaseID)+"/commit", `{"project":"fixture","note":"账号已绑定"}`)
+	if regularCommit.Code != http.StatusConflict || stringValue(decodeLeaseTestPayload(t, regularCommit)["code"]) != "lease_released" {
+		t.Fatalf("普通提交应继续拒绝已释放租约：status=%d body=%s", regularCommit.Code, regularCommit.Body.String())
+	}
+	reconcile := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(leaseID)+"/commit", `{
+		"project":"fixture",
+		"note":"注册未完成，但邮箱已绑定",
+		"reconcile_bound":true
+	}`)
+	if reconcile.Code != http.StatusOK {
+		t.Fatalf("已绑定纠偏接口状态码为 %d：%s", reconcile.Code, reconcile.Body.String())
+	}
+	reconcileData := payloadData(t, decodeLeaseTestPayload(t, reconcile))
+	if reconcileData["reconciled"] != true || payloadObject(t, reconcileData, "mailbox")["status"] != domain.StatusUsed || payloadObject(t, reconcileData, "lease")["state"] != domain.MailboxLeaseReleased {
+		t.Fatalf("已绑定纠偏结果不正确：%+v", reconcileData)
+	}
 }
 
 func newMailboxLeaseTestServer(t *testing.T) (*Server, *store.Store) {

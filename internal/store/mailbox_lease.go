@@ -20,6 +20,7 @@ var (
 	ErrLeaseReleased        = errors.New("邮箱租约已经释放")
 	ErrLeaseExpired         = errors.New("邮箱租约已经过期")
 	ErrLeaseBindingConflict = errors.New("邮箱与租约绑定关系不一致")
+	ErrLeaseReconcileState  = errors.New("只有已释放或已过期的邮箱租约可以执行已绑定纠偏")
 )
 
 // ClaimMailboxLease 在单个 SQLite 事务中原子执行 available -> reserved。
@@ -180,6 +181,65 @@ func (s *Store) CommitMailboxLease(leaseID, project, note string, now time.Time)
 		lease.Note, mailbox.Note = note, note
 	}
 	return s.finishLeaseMutation(tx, mailbox, lease, "info", fmt.Sprintf("项目 %s 已提交邮箱租约 %s，邮箱 %s 标记为已使用", lease.Project, lease.ID, mailbox.Email), false)
+}
+
+// ReconcileUsedMailboxLease 修复“上游账号已绑定，但租约此前被误释放”的历史状态。
+// 租约仍保留 released/expired 终态作为审计记录，只把仍处于 available 且未被
+// 重新领取的邮箱标记为 used；如果邮箱已经产生新租约，则拒绝覆盖。
+func (s *Store) ReconcileUsedMailboxLease(leaseID, project, note string, now time.Time) (domain.Mailbox, domain.MailboxLease, bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.Mailbox{}, domain.MailboxLease{}, false, err
+	}
+	lease, err := s.authorizedLeaseTx(tx, leaseID, project)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, domain.MailboxLease{}, false, err
+	}
+	var mailbox domain.Mailbox
+	mailboxFound, _ := s.readEntityTx(tx, "mailboxes", lease.MailboxID, &mailbox)
+	if !mailboxFound {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, lease, false, ErrLeaseBindingConflict
+	}
+	if lease.State == domain.MailboxLeaseCommitted || (mailbox.Status == domain.StatusUsed && mailbox.ActiveLeaseID == "") {
+		_ = tx.Rollback()
+		return mailbox, lease, true, nil
+	}
+	var latestLeaseID string
+	if err := tx.QueryRow(`SELECT id FROM mailbox_leases
+		WHERE json_extract(data_json, '$.mailbox_id') = ?
+		ORDER BY json_extract(data_json, '$.created_at') DESC, id DESC LIMIT 1`, lease.MailboxID).Scan(&latestLeaseID); err != nil || latestLeaseID != lease.ID {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, lease, false, ErrLeaseBindingConflict
+	}
+	if lease.State != domain.MailboxLeaseReleased && lease.State != domain.MailboxLeaseExpired {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, lease, false, ErrLeaseReconcileState
+	}
+	if mailbox.Status != domain.StatusAvailable || mailbox.ActiveLeaseID != "" {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, lease, false, ErrLeaseBindingConflict
+	}
+	note = strings.TrimSpace(note)
+	mailbox.Status, mailbox.ActiveLeaseID, mailbox.UpdatedAt = domain.StatusUsed, "", now
+	lease.UpdatedAt = now
+	if note != "" {
+		lease.Note, mailbox.Note = note, note
+	}
+	return s.finishLeaseMutation(
+		tx,
+		mailbox,
+		lease,
+		"warning",
+		fmt.Sprintf("项目 %s 已纠偏邮箱租约 %s，邮箱 %s 标记为已使用", lease.Project, lease.ID, mailbox.Email),
+		false,
+	)
 }
 
 func (s *Store) ReleaseMailboxLease(leaseID, project, note string, now time.Time) (domain.Mailbox, domain.MailboxLease, bool, error) {

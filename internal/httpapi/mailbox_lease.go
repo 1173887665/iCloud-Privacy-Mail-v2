@@ -12,10 +12,11 @@ import (
 )
 
 type mailboxLeaseActionRequest struct {
-	Project    string `json:"project"`
-	Note       string `json:"note"`
-	Reason     string `json:"reason"`
-	TTLSeconds int    `json:"ttl_seconds"`
+	Project        string `json:"project"`
+	Note           string `json:"note"`
+	Reason         string `json:"reason"`
+	TTLSeconds     int    `json:"ttl_seconds"`
+	ReconcileBound bool   `json:"reconcile_bound"`
 }
 
 func (s *Server) handlePublicMailboxLease(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +124,11 @@ func (s *Server) applyPublicMailboxLeaseAction(w http.ResponseWriter, r *http.Re
 	)
 	switch action {
 	case "commit":
-		mailbox, lease, idempotent, err = s.store.CommitMailboxLease(leaseID, project, note, now)
+		if request.ReconcileBound {
+			mailbox, lease, idempotent, err = s.store.ReconcileUsedMailboxLease(leaseID, project, note, now)
+		} else {
+			mailbox, lease, idempotent, err = s.store.CommitMailboxLease(leaseID, project, note, now)
+		}
 	case "release":
 		mailbox, lease, idempotent, err = s.store.ReleaseMailboxLease(leaseID, project, note, now)
 	case "renew":
@@ -142,6 +147,7 @@ func (s *Server) applyPublicMailboxLeaseAction(w http.ResponseWriter, r *http.Re
 		"mailbox":    s.publicMailbox(r, mailbox, true),
 		"lease":      s.publicMailboxLease(lease),
 		"idempotent": idempotent,
+		"reconciled": request.ReconcileBound,
 	}})
 }
 
@@ -233,6 +239,8 @@ func writeMailboxLeaseError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "lease_expired", err.Error())
 	case errors.Is(err, store.ErrLeaseBindingConflict):
 		writeError(w, http.StatusConflict, "lease_binding_conflict", err.Error())
+	case errors.Is(err, store.ErrLeaseReconcileState):
+		writeError(w, http.StatusConflict, "lease_reconcile_state", err.Error())
 	case errors.Is(err, store.ErrNoAvailableMailbox):
 		writeError(w, http.StatusOK, "no_available_mailbox", err.Error())
 	default:

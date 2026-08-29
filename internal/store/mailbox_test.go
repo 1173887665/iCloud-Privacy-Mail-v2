@@ -115,6 +115,46 @@ func TestMailboxLeaseReleaseAndRequestIDAreIdempotent(t *testing.T) {
 	if err != nil || !idempotent || repeatedLease.Note != "注册失败，释放邮箱" {
 		t.Fatalf("重复释放没有返回幂等结果：lease=%+v idempotent=%t err=%v", repeatedLease, idempotent, err)
 	}
+
+	reconciled, reconciledLease, idempotent, err := state.ReconcileUsedMailboxLease(
+		lease.ID,
+		"fixture",
+		"注册未完成，但邮箱已绑定",
+		now.Add(4*time.Minute),
+	)
+	if err != nil || idempotent || reconciled.Status != domain.StatusUsed || reconciledLease.State != domain.MailboxLeaseReleased {
+		t.Fatalf("已释放租约纠偏失败：mailbox=%+v lease=%+v idempotent=%t err=%v", reconciled, reconciledLease, idempotent, err)
+	}
+	if reconciled.Note != "注册未完成，但邮箱已绑定" {
+		t.Fatalf("纠偏备注没有同步到邮箱：%q", reconciled.Note)
+	}
+	repeated, _, idempotent, err := state.ReconcileUsedMailboxLease(lease.ID, "fixture", "重复纠偏", now.Add(5*time.Minute))
+	if err != nil || !idempotent || repeated.Status != domain.StatusUsed || repeated.Note != "注册未完成，但邮箱已绑定" {
+		t.Fatalf("重复纠偏没有返回幂等结果：mailbox=%+v idempotent=%t err=%v", repeated, idempotent, err)
+	}
+}
+
+func TestReleasedLeaseReconciliationRejectsMailboxWithNewerLease(t *testing.T) {
+	state, _ := newLeaseTestStore(t)
+	now := time.Date(2026, 8, 11, 11, 30, 0, 0, time.UTC)
+	_, oldLease, _, err := state.ClaimMailboxLease("fixture", "旧任务", "old-request", "", time.Hour, now)
+	if err != nil {
+		t.Fatalf("领取旧租约失败：%v", err)
+	}
+	if _, _, _, err := state.ReleaseMailboxLease(oldLease.ID, "fixture", "旧任务释放", now.Add(time.Minute)); err != nil {
+		t.Fatalf("释放旧租约失败：%v", err)
+	}
+	_, newLease, _, err := state.ClaimMailboxLease("fixture", "新任务", "new-request", "", time.Hour, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("领取新租约失败：%v", err)
+	}
+	if _, _, _, err := state.ReleaseMailboxLease(newLease.ID, "fixture", "新任务释放", now.Add(3*time.Minute)); err != nil {
+		t.Fatalf("释放新租约失败：%v", err)
+	}
+
+	if _, _, _, err := state.ReconcileUsedMailboxLease(oldLease.ID, "fixture", "旧任务账号已绑定", now.Add(4*time.Minute)); !errors.Is(err, ErrLeaseBindingConflict) {
+		t.Fatalf("旧租约不应覆盖更新的租约历史，实际错误：%v", err)
+	}
 }
 
 func TestMailboxLeaseExpiryReturnsMailboxToPool(t *testing.T) {
