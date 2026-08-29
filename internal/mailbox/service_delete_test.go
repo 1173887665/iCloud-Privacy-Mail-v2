@@ -171,17 +171,40 @@ func TestCleanRemoteMessagesUsesSharedSyncedMessageCleanup(t *testing.T) {
 	}
 }
 
+func TestRemoteMailCleanupStopsWhenWebAPIDisabled(t *testing.T) {
+	state, mailbox := newDeleteServiceFixture(t)
+	settings := state.Settings()
+	settings.EnableWebRemoteMailCleanup = false
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("关闭 Web API 远端邮件操作失败：%v", err)
+	}
+	client := &remoteMailboxDeleteClientFixture{}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	_, err := service.CleanRemoteMessages(context.Background(), mailbox.ID, RemoteCleanupOptions{MoveSynced: true})
+	if err == nil || !strings.Contains(err.Error(), "远端邮件操作已关闭") {
+		t.Fatalf("关闭 Web API 后的远端清理提示不正确：%v", err)
+	}
+	if len(client.operations) != 0 {
+		t.Fatalf("关闭 Web API 后仍执行了远端操作：%v", client.operations)
+	}
+}
+
 func TestCleanRemoteMailboxesPurgesAllLocalMessages(t *testing.T) {
 	state, mailbox := newDeleteServiceFixture(t)
 	client := &remoteMailboxDeleteClientFixture{}
 	service := NewService(config.Config{}, state)
 	service.deleteClient = client
 
-	result := service.CleanRemoteMailboxes(context.Background(), RemoteCleanupOptions{
+	result, err := service.CleanRemoteMailboxes(context.Background(), RemoteCleanupOptions{
 		MoveSynced: true,
 		EmptyTrash: true,
 		PurgeLocal: true,
 	})
+	if err != nil {
+		t.Fatalf("批量清理邮件失败：%v", err)
+	}
 
 	if result.FailedMailboxes != 0 {
 		t.Fatalf("全部清理出现失败：%+v", result.Failures)

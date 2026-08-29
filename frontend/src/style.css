@@ -1911,6 +1911,10 @@ textarea.field {
   grid-column: 1 / -1;
 }
 
+.settings-web-api {
+  grid-column: 1 / -1;
+}
+
 .settings-public-access {
   border-right: 1px solid var(--app-line);
 }

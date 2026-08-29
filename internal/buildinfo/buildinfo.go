@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	Version = "2.1.1"
+	Version = "2.1.2"
 	Commit  = "unknown"
 	BuiltAt = ""
 )
@@ -42,7 +42,7 @@ func Current() Info {
 	}
 
 	if version == "" {
-		version = "2.1.1"
+		version = "2.1.2"
 	}
 	if commit == "" {
 		commit = "unknown"

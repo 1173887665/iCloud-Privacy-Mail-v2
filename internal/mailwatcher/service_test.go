@@ -69,10 +69,15 @@ func TestGroupsIncludeIMAPAndWebOnlyAccounts(t *testing.T) {
 	_, _, _ = database.UpsertMailboxFromRemote(webSession.AccountID, domain.RemoteMailbox{Email: "web-alias@icloud.com", IsActive: true}, "")
 	service := NewService(config.Default(), database, mailboxservice.NewService(config.Default(), database), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	groups := service.groups()
+	groups := service.groups(true)
 	imapGroups, webGroups := groupModeCounts(groups)
 	if len(groups) != 2 || imapGroups != 1 || webGroups != 1 {
 		t.Fatalf("双路径监听分组不正确：groups=%+v，IMAP=%d，Web=%d", groups, imapGroups, webGroups)
+	}
+	imapOnlyGroups := service.groups(false)
+	imapOnlyCount, webOnlyCount := groupModeCounts(imapOnlyGroups)
+	if len(imapOnlyGroups) != 1 || imapOnlyCount != 1 || webOnlyCount != 0 || imapOnlyGroups[0].hasWeb {
+		t.Fatalf("关闭 Web API 后监听分组不正确：groups=%+v，IMAP=%d，Web=%d", imapOnlyGroups, imapOnlyCount, webOnlyCount)
 	}
 	service.Wake(imapMailbox.ID)
 	select {

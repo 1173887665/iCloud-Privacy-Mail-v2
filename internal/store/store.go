@@ -60,7 +60,7 @@ func (s *Store) initializeDatabase() error {
 		_ = tx.Rollback()
 		return err
 	}
-	var settings domain.Settings
+	settings := domain.DefaultSettings()
 	if found, err := s.readEntityTx(tx, "settings", "system", &settings); err != nil {
 		_ = tx.Rollback()
 		return err

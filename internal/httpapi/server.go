@@ -877,7 +877,11 @@ func (s *Server) handleMailboxesRemoteClean(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-	result := s.mailbox.CleanRemoteMailboxes(r.Context(), options)
+	result, err := s.mailbox.CleanRemoteMailboxes(r.Context(), options)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": result})
 }
 
@@ -919,7 +923,6 @@ func (s *Server) handleMailboxCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_after", err.Error())
 		return
 	}
-	s.watcher.Wake(r.PathValue("id"))
 	result, err := s.mailbox.Code(r.Context(), r.PathValue("id"), after, r.URL.Query().Get("keyword"), parseBool(r.URL.Query().Get("allow_stale")))
 	if err != nil {
 		writeServiceError(w, err)
@@ -1027,6 +1030,7 @@ func (s *Server) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
 		domain.Settings
 		ClearServerChanSendKey bool `json:"clear_server_chan_send_key"`
 	}
+	body.Settings = s.store.Settings()
 	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return

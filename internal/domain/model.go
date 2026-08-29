@@ -163,6 +163,10 @@ type Settings struct {
 	EnableAppleKeepAlive           bool   `json:"enable_apple_keep_alive"`
 	EnablePublicMailboxAPI         bool   `json:"enable_public_mailbox_api"`
 	EnablePublicCodePage           bool   `json:"enable_public_code_page"`
+	EnableWebCodeSync              bool   `json:"enable_web_code_sync"`
+	EnableWebManualMailSync        bool   `json:"enable_web_manual_mail_sync"`
+	EnableWebBackgroundMail        bool   `json:"enable_web_background_mail"`
+	EnableWebRemoteMailCleanup     bool   `json:"enable_web_remote_mail_cleanup"`
 	PublicAPIKey                   string `json:"public_api_key,omitempty"`
 	AppleAccountModuleReady        bool   `json:"apple_account_module_ready"`
 	ServerChanSendKey              string `json:"server_chan_send_key,omitempty"`
@@ -279,12 +283,16 @@ type Task struct {
 
 func DefaultSettings() Settings {
 	return Settings{
-		EnableMailWatcher:       false,
-		EnableAppleKeepAlive:    false,
-		EnablePublicMailboxAPI:  false,
-		EnablePublicCodePage:    false,
-		AppleAccountModuleReady: true,
-		ServerChanHideIP:        true,
+		EnableMailWatcher:          false,
+		EnableAppleKeepAlive:       false,
+		EnablePublicMailboxAPI:     false,
+		EnablePublicCodePage:       false,
+		EnableWebCodeSync:          false,
+		EnableWebManualMailSync:    true,
+		EnableWebBackgroundMail:    true,
+		EnableWebRemoteMailCleanup: true,
+		AppleAccountModuleReady:    true,
+		ServerChanHideIP:           true,
 	}
 }
 

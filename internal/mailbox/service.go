@@ -97,6 +97,7 @@ type MessageSyncOptions struct {
 	Limit            int
 	FullScan         bool
 	UseCursor        bool
+	AllowWebAPI      bool
 	AllowFallback    bool
 	UseWebComplement bool
 }
@@ -372,6 +373,9 @@ func (s *Service) SyncRemote(ctx context.Context, accountID string) ([]domain.Ma
 
 // DeleteCompletely 使用统一流程清理已同步的远端邮件、删除 Apple 隐私邮箱并清理本地数据。
 func (s *Service) DeleteCompletely(ctx context.Context, mailboxID string) error {
+	if !s.store.Settings().EnableWebRemoteMailCleanup {
+		return errors.New("iCloud Web API 远端邮件操作已关闭，请在系统设置中开启后再彻底删除邮箱")
+	}
 	mailbox, ok := s.store.FindMailboxByID(mailboxID)
 	if !ok {
 		return errors.New("邮箱不存在")
@@ -419,6 +423,9 @@ func (s *Service) DeleteLocal(mailboxID string) error {
 }
 
 func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, options RemoteCleanupOptions) (protocol.ICloudMailCleanupResult, error) {
+	if !s.store.Settings().EnableWebRemoteMailCleanup {
+		return protocol.ICloudMailCleanupResult{}, errors.New("iCloud Web API 远端邮件操作已关闭")
+	}
 	mailbox, ok := s.store.FindMailboxByID(mailboxID)
 	if !ok {
 		return protocol.ICloudMailCleanupResult{}, errors.New("邮箱不存在")
@@ -472,7 +479,10 @@ func (s *Service) cleanRemoteMessages(ctx context.Context, client remoteMailboxD
 	return result, nil
 }
 
-func (s *Service) CleanRemoteMailboxes(ctx context.Context, options RemoteCleanupOptions) RemoteCleanupBatchResult {
+func (s *Service) CleanRemoteMailboxes(ctx context.Context, options RemoteCleanupOptions) (RemoteCleanupBatchResult, error) {
+	if !s.store.Settings().EnableWebRemoteMailCleanup {
+		return RemoteCleanupBatchResult{}, errors.New("iCloud Web API 远端邮件操作已关闭")
+	}
 	options = normalizeRemoteCleanupOptions(options)
 	options.AccountID = strings.TrimSpace(options.AccountID)
 	client := s.deleteClient
@@ -565,10 +575,13 @@ func (s *Service) CleanRemoteMailboxes(ctx context.Context, options RemoteCleanu
 			cleanedTrash[sessionKey] = true
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (s *Service) StartAppleMailCleanup(parent context.Context, request AppleMailCleanupRequest) (AppleMailCleanupJob, error) {
+	if !s.store.Settings().EnableWebRemoteMailCleanup {
+		return AppleMailCleanupJob{}, errors.New("iCloud Web API 远端邮件操作已关闭")
+	}
 	request.Scope = strings.ToLower(strings.TrimSpace(request.Scope))
 	if request.Scope == "" {
 		request.Scope = "all"
@@ -860,18 +873,20 @@ func (s *Service) appleMailCleanupSnapshotLocked() AppleMailCleanupJob {
 }
 
 func (s *Service) SyncMessages(ctx context.Context, mailboxID string) (int, error) {
+	allowWebAPI := s.store.Settings().EnableWebCodeSync
 	result, err := s.syncMailboxMessagesWithOptions(ctx, mailboxID, MessageSyncOptions{
 		Mode: protocol.MailSyncModeVerification, Trigger: "verification", Limit: s.cfg.MailWatcherFetchLimit,
-		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+		UseCursor: true, AllowWebAPI: allowWebAPI, AllowFallback: allowWebAPI, UseWebComplement: allowWebAPI,
 	})
 	return result.SyncedMessages, err
 }
 
 // SyncMailboxMessages 同步指定邮箱所属 Apple 主号的新邮件，并把结果分发到该主号的全部隐私邮箱。
 func (s *Service) SyncMailboxMessages(ctx context.Context, mailboxID string) (MailboxMessageSyncBatchResult, error) {
+	allowWebAPI := s.store.Settings().EnableWebManualMailSync
 	return s.syncMailboxMessagesWithOptions(ctx, mailboxID, MessageSyncOptions{
 		Mode: protocol.MailSyncModeAllRecent, Trigger: "manual", Limit: s.cfg.MailWatcherFetchLimit,
-		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+		UseCursor: true, AllowWebAPI: allowWebAPI, AllowFallback: allowWebAPI, UseWebComplement: allowWebAPI,
 	})
 }
 
@@ -980,6 +995,7 @@ func (s *Service) syncExistingMailboxMessages(ctx context.Context, onStart func(
 
 func (s *Service) syncExistingMailboxMessageTargets(ctx context.Context, targets []existingMailboxMessageSyncTarget, totalMailboxes, skippedMailboxes int, onStart func(string), onFinish func(AccountMessageSyncResult)) (ExistingMailboxMessageSyncResult, error) {
 	result := ExistingMailboxMessageSyncResult{TotalAccounts: len(targets), TotalMailboxes: totalMailboxes, SkippedMailboxes: skippedMailboxes}
+	allowWebAPI := s.store.Settings().EnableWebManualMailSync
 	accountResults := make([]AccountMessageSyncResult, len(targets))
 	jobs := make(chan existingMailboxMessageSyncTarget)
 	workerCount := 3
@@ -997,7 +1013,7 @@ func (s *Service) syncExistingMailboxMessageTargets(ctx context.Context, targets
 				}
 				accountResult, syncErr := s.syncGroup(ctx, job.accountID, job.mailboxes, MessageSyncOptions{
 					Mode: protocol.MailSyncModeAllRecent, Trigger: "bulk-manual",
-					FullScan: true, UseCursor: false, AllowFallback: true, UseWebComplement: true,
+					FullScan: true, UseCursor: false, AllowWebAPI: allowWebAPI, AllowFallback: allowWebAPI, UseWebComplement: allowWebAPI,
 				})
 				if syncErr != nil {
 					accountResult.Error = syncErr.Error()
@@ -1183,9 +1199,10 @@ func summarizeExistingMailboxMessageSyncError(message string) string {
 
 // SyncMailboxBatch 按 Apple 账号批量拉取一次收件箱，再把邮件分发给对应隐私邮箱。
 func (s *Service) SyncMailboxBatch(ctx context.Context, mailboxes []domain.Mailbox, after time.Time, keyword string, maxMessages int) (int, error) {
+	allowWebAPI := s.store.Settings().EnableWebBackgroundMail
 	result, err := s.SyncMailboxBatchWithOptions(ctx, mailboxes, MessageSyncOptions{
 		Mode: protocol.MailSyncModeVerification, Trigger: "watcher", After: after, Limit: maxMessages,
-		UseCursor: true, AllowFallback: true, UseWebComplement: true,
+		UseCursor: true, AllowWebAPI: allowWebAPI, AllowFallback: allowWebAPI, UseWebComplement: allowWebAPI,
 	})
 	return result.SyncedMessages, err
 }
@@ -1310,7 +1327,7 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 			source = "imap"
 		}
 	}
-	if accountResult.Method == "imap" && options.UseWebComplement && protocol.CanUseICloudWebMail(session) {
+	if accountResult.Method == "imap" && options.AllowWebAPI && options.UseWebComplement && protocol.CanUseICloudWebMail(session) {
 		webResult, webErr := backend.SyncWeb(ctx, session, refreshed, protocolOptions)
 		if webErr == nil {
 			syncResult = mergeMailSyncBatchResults(syncResult, webResult)
@@ -1327,6 +1344,16 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 	if accountResult.Method == "" {
 		if ctx.Err() != nil {
 			return accountResult, ctx.Err()
+		}
+		if !options.AllowWebAPI {
+			switch {
+			case imapErr != nil:
+				return accountResult, fmt.Errorf("IMAP 读信失败，且当前功能的 iCloud Web API 已关闭：%w", imapErr)
+			case imapConfigured:
+				return accountResult, errors.New("IMAP 未完成读信，且当前功能的 iCloud Web API 已关闭")
+			default:
+				return accountResult, errors.New("未配置 IMAP，且当前功能的 iCloud Web API 已关闭")
+			}
 		}
 		if imapErr != nil && !options.AllowFallback {
 			return accountResult, imapErr
@@ -1463,7 +1490,7 @@ func mailSyncStateID(accountID, method string) string {
 }
 
 func messageSyncRequestSignature(mailboxes []domain.Mailbox, options MessageSyncOptions) string {
-	parts := []string{string(options.Mode), options.Trigger, options.After.UTC().Format(time.RFC3339Nano), fmt.Sprint(options.Limit), fmt.Sprint(options.FullScan), fmt.Sprint(options.UseCursor), fmt.Sprint(options.AllowFallback), fmt.Sprint(options.UseWebComplement)}
+	parts := []string{string(options.Mode), options.Trigger, options.After.UTC().Format(time.RFC3339Nano), fmt.Sprint(options.Limit), fmt.Sprint(options.FullScan), fmt.Sprint(options.UseCursor), fmt.Sprint(options.AllowWebAPI), fmt.Sprint(options.AllowFallback), fmt.Sprint(options.UseWebComplement)}
 	ids := make([]string, 0, len(mailboxes))
 	for _, mailbox := range mailboxes {
 		ids = append(ids, mailbox.ID)

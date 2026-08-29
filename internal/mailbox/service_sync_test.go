@@ -169,6 +169,63 @@ func TestSyncMailboxBatchUsesIMAPFirst(t *testing.T) {
 	}
 }
 
+func TestCodeSyncDoesNotUseWebAPIByDefault(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "code-default@icloud.com", false)
+	backend := &fakeMessageSyncBackend{webResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}}}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	_, err := service.SyncMessages(context.Background(), mailbox.ID)
+	if err == nil || !strings.Contains(err.Error(), "未配置 IMAP") || !strings.Contains(err.Error(), "Web API 已关闭") {
+		t.Fatalf("默认即时取码渠道提示不正确：%v", err)
+	}
+	if imap, web, _ := backend.counts(); imap != 0 || web != 0 {
+		t.Fatalf("默认即时取码不应请求读信渠道：IMAP=%d，Web=%d", imap, web)
+	}
+}
+
+func TestCodeSyncUsesWebAPIWhenEnabled(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "code-enabled@icloud.com", false)
+	settings := state.Settings()
+	settings.EnableWebCodeSync = true
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("开启 Web API 即时取码失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{webResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, Scanned: 1}}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	if _, err := service.SyncMessages(context.Background(), mailbox.ID); err != nil {
+		t.Fatalf("Web API 即时取码失败：%v", err)
+	}
+	if imap, web, _ := backend.counts(); imap != 0 || web != 1 {
+		t.Fatalf("即时取码 Web API 调用次数不正确：IMAP=%d，Web=%d", imap, web)
+	}
+}
+
+func TestManualSyncUsesOnlyIMAPWhenWebAPIDisabled(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "manual-imap-only@icloud.com", true)
+	settings := state.Settings()
+	settings.EnableWebManualMailSync = false
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("关闭 Web API 手动同步失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, Scanned: 2}}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	result, err := service.SyncMailboxMessages(context.Background(), mailbox.ID)
+	if err != nil || result.IMAPAccounts != 1 || result.WebAPIAccounts != 0 {
+		t.Fatalf("关闭 Web API 后的手动同步结果不正确：结果=%+v，错误=%v", result, err)
+	}
+	if imap, web, _ := backend.counts(); imap != 1 || web != 0 {
+		t.Fatalf("关闭 Web API 后手动同步仍发起了补查：IMAP=%d，Web=%d", imap, web)
+	}
+}
+
 func TestSyncExistingMailboxMessagesComplementsIMAPWithWeb(t *testing.T) {
 	state := openSyncTestStore(t)
 	mailbox := saveSyncTestAccount(t, state, "complement@icloud.com", true)

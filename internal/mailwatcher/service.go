@@ -129,8 +129,10 @@ func (s *Service) Run(ctx context.Context) {
 
 	enabledLastCycle := false
 	cycle := func(targetAccountID string) {
-		enabled := s.cfg.MailWatcherEnabled && s.store.Settings().EnableMailWatcher
-		groups := s.groups()
+		settings := s.store.Settings()
+		enabled := s.cfg.MailWatcherEnabled && settings.EnableMailWatcher
+		allowWebAPI := settings.EnableWebBackgroundMail
+		groups := s.groups(allowWebAPI)
 		imapGroups, webPollingGroups := groupModeCounts(groups)
 		s.updateStatus(func(status *Status) {
 			status.Enabled = enabled
@@ -286,7 +288,7 @@ func (s *Service) syncWatchGroup(ctx context.Context, group watchGroup, initial,
 	syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
 	result, err := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
 		Mode: protocol.MailSyncModeVerification, Trigger: "watcher", After: after, Limit: limit,
-		UseCursor: true, AllowFallback: true, UseWebComplement: group.hasIMAP && group.hasWeb,
+		UseCursor: true, AllowWebAPI: group.hasWeb, AllowFallback: group.hasWeb, UseWebComplement: group.hasIMAP && group.hasWeb,
 	})
 	cancel()
 	s.recordSyncResult(result, err, webPoll)
@@ -345,7 +347,7 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 			syncCtx, cancel := context.WithTimeout(ctx, mailWatcherSyncTimeout)
 			result, syncErr := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
 				Mode: protocol.MailSyncModeVerification, Trigger: "imap-idle", Limit: s.cfg.MailWatcherFetchLimit,
-				UseCursor: true, AllowFallback: true, UseWebComplement: group.hasWeb,
+				UseCursor: true, AllowWebAPI: group.hasWeb, AllowFallback: group.hasWeb, UseWebComplement: group.hasWeb,
 			})
 			cancel()
 			s.recordSyncResult(result, syncErr, false)
@@ -483,7 +485,7 @@ func (s *Service) resetReadyWorkers() {
 	})
 }
 
-func (s *Service) groups() []watchGroup {
+func (s *Service) groups(allowWebAPI bool) []watchGroup {
 	active := s.activeMailboxIDs(time.Now())
 	type bucket struct {
 		session   domain.ICloudSession
@@ -514,7 +516,7 @@ func (s *Service) groups() []watchGroup {
 		session := entry.session
 		imapState, imapSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
 		hasIMAP := imapSaved && strings.TrimSpace(imapState.IMAPEmail) != "" && strings.TrimSpace(imapState.IMAPAppPassword) != ""
-		hasWeb := protocol.CanUseICloudWebMail(session)
+		hasWeb := allowWebAPI && protocol.CanUseICloudWebMail(session)
 		if !hasIMAP && !hasWeb {
 			continue
 		}

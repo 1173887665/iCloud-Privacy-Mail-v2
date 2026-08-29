@@ -202,7 +202,6 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 		IncludeServed: cacheOnly || peekOnly,
 		MarkAsServed:  !cacheOnly && !peekOnly,
 	}
-	s.watcher.Wake(mailbox.ID)
 	if result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query); lookupErr != nil {
 		writeServiceError(w, lookupErr)
 		return
@@ -348,7 +347,6 @@ func (s *Server) handlePublicCodePageMessages(w http.ResponseWriter, r *http.Req
 	}
 	var syncErr error
 	if parseBool(r.URL.Query().Get("sync")) {
-		s.watcher.Wake(mailbox.ID)
 		minInterval := time.Duration(s.cfg.PublicSyncMinIntervalMS) * time.Millisecond
 		if minInterval < 0 {
 			minInterval = 0

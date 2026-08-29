@@ -39,6 +39,42 @@ func TestSQLiteInitializesEmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteAddsWebAPISettingsToExistingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.db")
+	state, err := Open(path)
+	if err != nil {
+		t.Fatalf("创建 SQLite 数据库失败：%v", err)
+	}
+	_, protected, err := state.marshalEntity("settings", map[string]any{
+		"enable_mail_watcher":       true,
+		"enable_apple_keep_alive":   false,
+		"enable_public_mailbox_api": false,
+		"enable_public_code_page":   false,
+	})
+	if err != nil {
+		t.Fatalf("生成旧设置数据失败：%v", err)
+	}
+	if _, err := state.db.Exec(`UPDATE settings SET data_json = ? WHERE id = 'system'`, protected); err != nil {
+		t.Fatalf("写入旧设置数据失败：%v", err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatalf("关闭 SQLite 数据库失败：%v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("重新打开 SQLite 数据库失败：%v", err)
+	}
+	defer reopened.Close()
+	settings := reopened.Settings()
+	if settings.EnableWebCodeSync {
+		t.Fatal("升级后 Web API 即时取码应默认关闭")
+	}
+	if !settings.EnableWebManualMailSync || !settings.EnableWebBackgroundMail || !settings.EnableWebRemoteMailCleanup {
+		t.Fatalf("升级后其余 Web API 开关应保持开启：%+v", settings)
+	}
+}
+
 func TestSQLiteDoesNotImportLegacyStateJSON(t *testing.T) {
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "state.json")

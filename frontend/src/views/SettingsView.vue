@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Bell, CalendarClock, CheckCircle2, CircleAlert, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, LogIn, Monitor, PackageOpen, RefreshCw, Save, Send, ShieldCheck, Sparkles, WifiOff } from '@lucide/vue'
+import { Bell, CalendarClock, CheckCircle2, CircleAlert, Cloud, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, LogIn, Monitor, PackageOpen, RefreshCw, Save, Send, ShieldCheck, Sparkles, Trash2, WifiOff } from '@lucide/vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api/client'
 import { subscribeRealtime } from '../composables/useRealtime'
@@ -21,6 +21,10 @@ const form = reactive({
   enable_apple_keep_alive: false,
   enable_public_mailbox_api: false,
   enable_public_code_page: false,
+  enable_web_code_sync: false,
+  enable_web_manual_mail_sync: true,
+  enable_web_background_mail: true,
+  enable_web_remote_mail_cleanup: true,
   public_api_key: '',
   apple_account_module_ready: true,
   server_chan_send_key: '',
@@ -38,15 +42,14 @@ const publicAPIKeySourceText = computed(() => {
 })
 const mailWatcherStatusText = computed(() => {
   const status = runtime.value.mail_watcher_status || {}
-  if (!runtime.value.mail_watcher_available) return '配置文件已关闭监听能力'
+  if (!runtime.value.mail_watcher_available) return '配置已关闭'
   if (!form.enable_mail_watcher) return '未开启'
   if (!status.running) return '启动中'
-  if (!status.group_count) return '等待可用读信登录态'
-  if (status.last_error) return `运行异常：${status.last_error}`
-  const imap = `IMAP IDLE ${status.connected_worker_count || 0}/${status.worker_count || 0}`
-  const web = `Web API 轮询 ${status.web_polling_group_count || 0} 个（${Math.round((runtime.value.mail_watcher_web_poll_ms || 60000) / 1000)} 秒）`
-  if (!status.connected_worker_count && status.worker_count && status.last_idle_error) return `IDLE 连接异常，Web API 低频兜底中：${status.last_idle_error}`
-  return `${imap}，${web}，回退 ${status.web_fallbacks || 0} 次，已同步 ${status.synced_messages || 0} 封`
+  if (!status.group_count) return form.enable_web_background_mail ? '等待读信账号' : '等待 IMAP 账号'
+  if (status.last_error) return '同步异常，请查看日志'
+  if (!status.connected_worker_count && status.worker_count && status.last_idle_error) return form.enable_web_background_mail ? 'IMAP 异常｜Web 兜底中' : 'IMAP 连接异常'
+  const web = form.enable_web_background_mail ? status.web_polling_group_count || 0 : '关'
+  return `IMAP ${status.connected_worker_count || 0}/${status.worker_count || 0}｜Web ${web}｜同步 ${status.synced_messages || 0}`
 })
 const mailWatcherStatusClass = computed(() => {
   const status = runtime.value.mail_watcher_status || {}
@@ -265,13 +268,38 @@ onBeforeUnmount(() => {
           <div class="grid gap-4 sm:grid-cols-2">
             <label class="settings-capability-option">
               <span class="settings-capability-option-icon"><Monitor :size="16" /></span>
-              <span class="settings-capability-option-copy"><strong>邮件后台监听</strong><small>IMAP 使用 IDLE 实时接收；未配置或断线时由 Web API 低频轮询。</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">状态：{{ mailWatcherStatusText }}</small></span>
+              <span class="settings-capability-option-copy"><strong>邮件后台监听</strong><small>IMAP IDLE 收信，Web API 断线兜底。</small><small :class="mailWatcherStatusClass" class="mt-1 font-semibold">{{ mailWatcherStatusText }}</small></span>
               <input v-model="form.enable_mail_watcher" class="detail-switch" type="checkbox" :disabled="!runtime.mail_watcher_available" />
             </label>
             <label class="settings-capability-option">
               <span class="settings-capability-option-icon"><RefreshCw :size="16" /></span>
               <span class="settings-capability-option-copy"><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span>
               <input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" />
+            </label>
+          </div>
+        </section>
+        <section class="settings-web-api">
+          <h3 class="section-title flex items-center gap-2"><Cloud :size="16" />iCloud Web API</h3>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><KeyRound :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>Web API 即时取码</strong><small>后台与公共取码在 IMAP 未命中时补查；默认关闭。</small></span>
+              <input v-model="form.enable_web_code_sync" class="detail-switch" type="checkbox" />
+            </label>
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><RefreshCw :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>Web API 手动邮件同步</strong><small>用于表格、详情和全部已有邮箱的邮件补查与回退。</small></span>
+              <input v-model="form.enable_web_manual_mail_sync" class="detail-switch" type="checkbox" />
+            </label>
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><Monitor :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>Web API 后台邮件监听</strong><small>用于首次扫描、IMAP IDLE 补查及低频轮询。</small></span>
+              <input v-model="form.enable_web_background_mail" class="detail-switch" type="checkbox" />
+            </label>
+            <label class="settings-capability-option">
+              <span class="settings-capability-option-icon"><Trash2 :size="16" /></span>
+              <span class="settings-capability-option-copy"><strong>Web API 远端邮件操作</strong><small>允许移动邮件、清空废纸篓、云端清理及彻底删除邮箱。</small></span>
+              <input v-model="form.enable_web_remote_mail_cleanup" class="detail-switch" type="checkbox" />
             </label>
           </div>
         </section>
@@ -338,7 +366,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="grid gap-px bg-slate-200 dark:bg-slate-700 sm:grid-cols-2 lg:grid-cols-4">
-          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.1.1' }}</strong></div>
+          <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><PackageOpen :size="12" />当前版本</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current?.version || '2.1.2' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><GitCommit :size="12" />构建提交</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ shortCommit(updateState.status?.current?.commit) }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><Monitor :size="12" />运行平台</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ updateState.status?.current ? `${updateState.status.current.os} / ${updateState.status.current.arch}` : '-' }}</strong></div>
           <div class="min-h-[5.25rem] bg-white px-5 py-4 dark:bg-slate-800"><span class="flex h-4 items-center gap-1.5 text-[10px] font-bold uppercase leading-4 tracking-[0.14em] text-slate-400"><CalendarClock :size="12" />检查时间</span><strong class="mt-1 block h-5 truncate text-sm font-semibold leading-5 text-slate-800 dark:text-slate-100">{{ formatDate(updateState.status?.checked_at) }}</strong></div>

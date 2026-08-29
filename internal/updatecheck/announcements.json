@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.1.1",
-    "name": "2.1.1 源码版",
-    "notes": "修复 iCloud Web 全量补查的请求参数校验错误，邮件同步改为后台队列并实时显示进度。请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-29T00:00:00+08:00",
+    "version": "2.1.2",
+    "name": "2.1.2 源码版",
+    "notes": "新增 iCloud Web API 分场景开关，即时取码渠道默认关闭，并压缩后台监听状态提示。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-29T22:30:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-1-2",
+      "type": "update",
+      "title": "2.1.2 Web API 渠道控制已更新",
+      "summary": "取码、手动同步、后台监听和远端邮件操作现在可以独立控制。",
+      "content": "系统设置新增四个 iCloud Web API 开关：即时取码、手动邮件同步、后台邮件监听和远端邮件操作。即时取码的 Web API 渠道默认关闭，其余渠道默认开启；关闭后对应场景仅使用 IMAP，本地已保存的邮件和验证码仍可读取。后台监听状态已压缩为紧凑格式，避免设置卡片高度变化。",
+      "published_at": "2026-08-29T22:30:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-1-1",
       "type": "update",
