@@ -283,7 +283,7 @@ onBeforeUnmount(() => {
           <div class="grid gap-4 sm:grid-cols-2">
             <label class="settings-capability-option">
               <span class="settings-capability-option-icon"><KeyRound :size="16" /></span>
-              <span class="settings-capability-option-copy"><strong>Web API 即时取码</strong><small>后台与公共取码在 IMAP 未命中时补查；默认关闭。</small></span>
+              <span class="settings-capability-option-copy"><strong>Web API 取码与邮件刷新</strong><small>后台与公共取码、公共页面邮件刷新时使用 Web API 补查；默认关闭。</small></span>
               <input v-model="form.enable_web_code_sync" class="detail-switch" type="checkbox" />
             </label>
             <label class="settings-capability-option">
