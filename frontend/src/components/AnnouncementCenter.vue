@@ -15,6 +15,7 @@ const {
 const root = ref(null)
 const open = ref(false)
 const activeAnnouncement = ref(null)
+let refreshTimer = null
 const unreadLabel = computed(() => unreadAnnouncements.value.length > 9 ? '9+' : String(unreadAnnouncements.value.length))
 
 function typeMeta(type) {
@@ -62,10 +63,13 @@ onMounted(() => {
   document.addEventListener('click', handleDocumentClick)
   window.addEventListener('keydown', handleKeydown)
   loadUpdates().catch(() => {})
+  refreshTimer = window.setInterval(() => loadUpdates(true).catch(() => {}), 10 * 60 * 1000)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
   window.removeEventListener('keydown', handleKeydown)
+  if (refreshTimer) window.clearInterval(refreshTimer)
+  refreshTimer = null
 })
 </script>
 
