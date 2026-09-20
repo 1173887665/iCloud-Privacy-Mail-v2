@@ -24,6 +24,7 @@ const (
 	requestTimeout  = 20 * time.Second
 	responseMaxSize = 4 << 20
 	githubRawURL    = "https://raw.githubusercontent.com"
+	githubAPIURL    = "https://api.github.com"
 )
 
 //go:embed announcements.json
@@ -45,6 +46,8 @@ type LatestInfo struct {
 	Notes       string `json:"notes"`
 	PublishedAt string `json:"published_at"`
 	URL         string `json:"url"`
+	CommitSHA   string `json:"commit_sha,omitempty"`
+	CommitURL   string `json:"commit_url,omitempty"`
 	Source      string `json:"source"`
 }
 
@@ -65,6 +68,7 @@ type Service struct {
 	repository string
 	client     *http.Client
 	rawBaseURL string
+	apiBaseURL string
 	mu         sync.Mutex
 	cachedAt   time.Time
 	cached     Status
@@ -94,6 +98,8 @@ type latestDocument struct {
 	Notes       string `json:"notes"`
 	PublishedAt string `json:"published_at"`
 	URL         string `json:"url"`
+	CommitSHA   string `json:"commit_sha"`
+	CommitURL   string `json:"commit_url"`
 }
 
 func New(enabled bool, repository string) *Service {
@@ -102,6 +108,7 @@ func New(enabled bool, repository string) *Service {
 		repository: strings.Trim(strings.TrimSpace(repository), "/"),
 		client:     &http.Client{Timeout: requestTimeout},
 		rawBaseURL: githubRawURL,
+		apiBaseURL: githubAPIURL,
 	}
 }
 
@@ -164,6 +171,19 @@ func (s *Service) check(ctx context.Context, checkedAt time.Time) Status {
 		status.Error = "仓库公告配置无效：" + err.Error()
 		return status
 	}
+	if latest.CommitSHA == "" {
+		remoteCommit, commitErr := s.fetchLatestCommit(ctx)
+		if commitErr == nil {
+			latest.CommitSHA = remoteCommit.SHA
+			latest.CommitURL = remoteCommit.URL
+			if commitIsNewer(status.Current.Commit, latest.CommitSHA) {
+				updateAvailable = true
+				if updateAnnouncement == nil {
+					updateAnnouncement = commitAnnouncement(*latest)
+				}
+			}
+		}
+	}
 	status.Latest = latest
 	status.UpdateAvailable = updateAvailable
 	if updateAnnouncement != nil {
@@ -179,6 +199,8 @@ func configuredLatest(current buildinfo.Info, document latestDocument) (*LatestI
 		Notes:       truncateText(strings.TrimSpace(document.Notes), 8000),
 		PublishedAt: strings.TrimSpace(document.PublishedAt),
 		URL:         safeHTTPSURL(document.URL),
+		CommitSHA:   normalizeCommitSHA(document.CommitSHA),
+		CommitURL:   safeHTTPSURL(document.CommitURL),
 		Source:      "config",
 	}
 	if latest.Version == "" {
@@ -192,6 +214,10 @@ func configuredLatest(current buildinfo.Info, document latestDocument) (*LatestI
 	}
 	latest.Name = firstNonEmpty(latest.Name, latest.Version)
 	updateAvailable := versionIsNewer(current.Version, latest.Version)
+	if commitIsNewer(current.Commit, latest.CommitSHA) {
+		updateAvailable = true
+		return &latest, true, commitAnnouncement(latest), nil
+	}
 	if !updateAvailable {
 		return &latest, false, nil, nil
 	}
@@ -205,6 +231,69 @@ func configuredLatest(current buildinfo.Info, document latestDocument) (*LatestI
 		URL:         latest.URL,
 	})
 	return &latest, updateAvailable, &announcement, nil
+}
+
+type githubCommit struct {
+	SHA string
+	URL string
+}
+
+type githubCommitDocument struct {
+	SHA     string `json:"sha"`
+	HTMLURL string `json:"html_url"`
+}
+
+func (s *Service) fetchLatestCommit(ctx context.Context) (githubCommit, error) {
+	targetURL := strings.TrimRight(s.apiBaseURL, "/") + "/repos/" + s.repository + "/commits?per_page=1"
+	var documents []githubCommitDocument
+	if err := s.get(ctx, targetURL, "application/vnd.github+json", func(reader io.Reader) error {
+		return json.NewDecoder(reader).Decode(&documents)
+	}); err != nil {
+		return githubCommit{}, err
+	}
+	if len(documents) == 0 || !validCommitSHA(documents[0].SHA) {
+		return githubCommit{}, errors.New("GitHub 未返回有效的最新提交")
+	}
+	return githubCommit{SHA: normalizeCommitSHA(documents[0].SHA), URL: safeHTTPSURL(documents[0].HTMLURL)}, nil
+}
+
+func normalizeCommitSHA(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func validCommitSHA(value string) bool {
+	value = normalizeCommitSHA(value)
+	if len(value) < 7 || len(value) > 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func commitIsNewer(current, latest string) bool {
+	current = normalizeCommitSHA(current)
+	latest = normalizeCommitSHA(latest)
+	return validCommitSHA(current) && validCommitSHA(latest) && current != latest
+}
+
+func commitAnnouncement(latest LatestInfo) *Announcement {
+	short := latest.CommitSHA
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return &Announcement{
+		ID:          "commit-" + short,
+		Type:        "update",
+		Title:       "GitHub 源码已更新",
+		Summary:     "发现新的 GitHub 提交 " + short + "，请按部署方式更新服务器。",
+		Content:     firstNonEmpty(latest.Notes, "发现新的 GitHub 提交，请先备份 data 目录，再按 deploy/README.md 更新服务器。"),
+		PublishedAt: latest.PublishedAt,
+		URL:         firstNonEmpty(latest.CommitURL, latest.URL),
+	}
 }
 
 func (s *Service) fetchRepositoryDocument(ctx context.Context) (announcementDocument, error) {

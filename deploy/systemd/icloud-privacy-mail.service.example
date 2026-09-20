@@ -1,0 +1,24 @@
+[Unit]
+Description=iCloud Privacy Mail
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ipm
+Group=ipm
+WorkingDirectory=/opt/iCloud-Privacy-Mail-v2
+ExecStart=/opt/iCloud-Privacy-Mail-v2/bin/ipm-server -config /opt/iCloud-Privacy-Mail-v2/config.json
+Restart=on-failure
+RestartSec=5s
+Environment=TZ=Asia/Shanghai
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/iCloud-Privacy-Mail-v2/data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

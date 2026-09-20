@@ -193,6 +193,7 @@ type CodeQuery struct {
 	SkipMessageID string
 	IncludeServed bool
 	MarkAsServed  bool
+	AllowStale    bool
 }
 
 type RemoteCleanupOptions struct {
@@ -1689,7 +1690,9 @@ func (s *Service) findCode(mailbox domain.Mailbox, query CodeQuery) (CodeResult,
 			}
 		}
 	}
-	after = codeAfter(after, time.Now())
+	if !query.AllowStale {
+		after = codeAfter(after, time.Now())
+	}
 	for _, message := range s.store.MessagesForMailbox(mailbox.ID) {
 		messageTime := message.ReceivedAt
 		if messageTime.IsZero() {

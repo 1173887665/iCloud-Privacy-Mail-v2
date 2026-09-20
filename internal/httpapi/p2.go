@@ -195,12 +195,18 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 	allowStale := parseBool(r.URL.Query().Get("allow_stale"))
 	cacheOnly := parseBool(r.URL.Query().Get("cache"))
 	peekOnly := parseBool(r.URL.Query().Get("peek")) || parseBool(r.URL.Query().Get("preview"))
+	consume := parseBool(r.URL.Query().Get("consume"))
+	skipMessageID := ""
+	if consume {
+		skipMessageID = mailbox.LastCodeMessageID
+	}
 	query := mailboxservice.CodeQuery{
 		After:         after,
 		Keyword:       keyword,
-		SkipMessageID: mailbox.LastCodeMessageID,
-		IncludeServed: cacheOnly || peekOnly,
-		MarkAsServed:  !cacheOnly && !peekOnly,
+		SkipMessageID: skipMessageID,
+		IncludeServed: !consume || cacheOnly || peekOnly || allowStale,
+		MarkAsServed:  consume && !cacheOnly && !peekOnly && !allowStale,
+		AllowStale:    true,
 	}
 	if result, found, lookupErr := s.mailbox.CachedCodeWithQuery(mailbox.ID, query); lookupErr != nil {
 		writeServiceError(w, lookupErr)
@@ -427,7 +433,8 @@ func publicMessageContent(message domain.Message) map[string]any {
 }
 
 func (s *Server) staleCachedCode(mailboxID string, query mailboxservice.CodeQuery) (mailboxservice.CodeResult, bool, error) {
-	query.IncludeServed = false
+	query.AllowStale = true
+	query.IncludeServed = true
 	query.MarkAsServed = false
 	return s.mailbox.CachedCodeWithQuery(mailboxID, query)
 }

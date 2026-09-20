@@ -18,7 +18,7 @@ import (
 
 func TestPublicCodePageListsAndReadsMailboxMessages(t *testing.T) {
 	server, state, mailbox := newPublicCodeTestServer(t, true)
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
 	created, err := state.ApplyMailboxSyncBatch([]store.MailboxSyncUpdate{{MailboxID: mailbox.ID, Messages: []store.MailboxSyncMessage{{
 		RemoteID: "imap:42", Source: "imap", Subject: "登录验证码", From: "OpenAI <noreply@example.com>",
 		Body: "验证码是 123456", HTMLBody: "<p>验证码是 <strong>123456</strong></p>", ContentType: "text/html", ReceivedAt: now,
@@ -59,6 +59,32 @@ func TestPublicCodePageMessagesRequireEnabledSetting(t *testing.T) {
 	response := publicCodeTestRequest(t, server, "/api/v1/public-code/messages?email="+url.QueryEscape(mailbox.Email))
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("关闭公共页面后的状态码为 %d，期望 403：%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPublicMailboxCodeReturnsLatestCodeRepeatedly(t *testing.T) {
+	server, state, mailbox := newPublicCodeTestServer(t, true)
+	settings := state.Settings()
+	settings.EnablePublicMailboxAPI = true
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("开启公共邮箱 API 失败：%v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := state.ApplyMailboxSyncBatch([]store.MailboxSyncUpdate{{MailboxID: mailbox.ID, Messages: []store.MailboxSyncMessage{{
+		RemoteID: "imap:latest", Source: "imap", Subject: "OpenAI 验证码 654321", Body: "验证码 654321", ReceivedAt: now,
+	}}}}); err != nil {
+		t.Fatalf("准备验证码邮件失败：%v", err)
+	}
+	path := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/code?key=" + url.QueryEscape(mailbox.APIToken) + "&wait_ms=0"
+	for attempt := 0; attempt < 2; attempt++ {
+		response := publicCodeTestRequest(t, server, path)
+		if response.Code != http.StatusOK {
+			t.Fatalf("第 %d 次取码状态为 %d：%s", attempt+1, response.Code, response.Body.String())
+		}
+		data := publicCodeTestData(t, response)
+		if data["code"] != "654321" {
+			t.Fatalf("第 %d 次没有返回最新验证码：%+v", attempt+1, data)
+		}
 	}
 }
 

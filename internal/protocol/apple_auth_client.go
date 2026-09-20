@@ -69,6 +69,7 @@ type appleAuthSession struct {
 	HCChallenge         string
 	CompleteHCBits      int
 	CompleteHCChallenge string
+	ReferrerQuery       string
 	TwoFactorPhone      json.RawMessage
 	TwoFactorMethod     string
 	Cookies             []SessionCookie
@@ -360,18 +361,7 @@ func (c *AppleAuthClient) Submit2FA(ctx context.Context, pending appleAuthPendin
 	if len(code) != 6 {
 		return ICloudSession{}, errCode("invalid_2fa_code", "2FA 验证码必须是 6 位", false)
 	}
-	session := pending.Session
-	for attempt := 0; attempt < 2; attempt++ {
-		icloudSession, err := c.submit2FAWithSession(ctx, session, code)
-		if err == nil {
-			return icloudSession, nil
-		}
-		var redirect appleDomainRedirectError
-		if !errors.As(err, &redirect) || !session.switchHost(redirect.Host) {
-			return ICloudSession{}, err
-		}
-	}
-	return ICloudSession{}, errCode("apple_domain_switch_failed", "Apple 登录域切换后仍未完成 2FA，请重新发起协议登录", true)
+	return c.submit2FAWithSession(ctx, pending.Session, code)
 }
 
 func (c *AppleAuthClient) SubmitAppleAccountManage2FA(ctx context.Context, pending appleAuthPending, code string, phoneNumber json.RawMessage) (ICloudSession, error) {
@@ -410,7 +400,23 @@ func (c *AppleAuthClient) submit2FAWithSession(ctx context.Context, session *app
 	if err := c.trustSession(ctx, session); err != nil {
 		return ICloudSession{}, err
 	}
-	return c.authWithTokenAndValidate(ctx, session)
+	return retryAppleDomainRedirect(session, func() (ICloudSession, error) {
+		return c.authWithTokenAndValidate(ctx, session)
+	})
+}
+
+func retryAppleDomainRedirect(session *appleAuthSession, fn func() (ICloudSession, error)) (ICloudSession, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		icloudSession, err := fn()
+		if err == nil {
+			return icloudSession, nil
+		}
+		var redirect appleDomainRedirectError
+		if !errors.As(err, &redirect) || !session.switchHost(redirect.Host) {
+			return ICloudSession{}, err
+		}
+	}
+	return ICloudSession{}, errCode("apple_domain_switch_failed", "Apple 登录域切换后仍未完成 2FA，请重新发起协议登录", true)
 }
 
 func appleAuthEndpointsForHost(host string) appleAuthEndpoints {
@@ -725,7 +731,7 @@ func (c *AppleAuthClient) validatePhoneSecurityCode(ctx context.Context, session
 		"securityCode": map[string]string{"code": code},
 		"mode":         "sms",
 	}
-	_, _, err = c.do(ctx, session, http.MethodPost, session.Endpoints.Auth+"/verify/phone/securitycode", session.twoFactorHeaders(), body, nil, false)
+	_, _, err = c.do(ctx, session, http.MethodPost, session.Endpoints.Auth+"/verify/phone/securitycode"+session.ReferrerQuery, session.twoFactorHeaders(), body, nil, false)
 	if err != nil {
 		return errCode("apple_2fa_failed", "Apple 短信 2FA 验证失败："+err.Error(), true)
 	}
@@ -764,6 +770,21 @@ func (s *appleAuthSession) rememberTwoFactorPhoneNumber(data []byte) bool {
 	if s == nil {
 		return false
 	}
+	for _, bootData := range extractAppleBootArgsJSONs(data) {
+		var root any
+		if err := json.Unmarshal(bootData, &root); err != nil {
+			continue
+		}
+		if referrerQuery := firstAppleReferrerQuery(root, 0); referrerQuery != "" {
+			s.ReferrerQuery = referrerQuery
+		}
+		if phone, ok := firstApplePhoneNumber(root, 0); ok {
+			if encoded, err := json.Marshal(phone); err == nil {
+				s.TwoFactorPhone = encoded
+				return true
+			}
+		}
+	}
 	payload := extractAppleAppConfigJSON(data)
 	if len(payload) == 0 {
 		payload = bytes.TrimSpace(data)
@@ -779,6 +800,61 @@ func (s *appleAuthSession) rememberTwoFactorPhoneNumber(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func extractAppleBootArgsJSONs(data []byte) [][]byte {
+	text := string(data)
+	var out [][]byte
+	for _, marker := range []string{`class="boot_args"`, `class='boot_args'`} {
+		for offset := 0; offset < len(text); {
+			idx := strings.Index(text[offset:], marker)
+			if idx < 0 {
+				break
+			}
+			idx += offset
+			offset = idx + len(marker)
+			open := strings.Index(text[idx:], ">")
+			if open < 0 {
+				break
+			}
+			start := idx + open + 1
+			end := strings.Index(text[start:], "</script>")
+			if end < 0 {
+				break
+			}
+			var value any
+			if err := json.Unmarshal([]byte(strings.TrimSpace(text[start:start+end])), &value); err == nil {
+				if encoded, err := json.Marshal(value); err == nil {
+					out = append(out, encoded)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func firstAppleReferrerQuery(value any, depth int) string {
+	if depth > 16 {
+		return ""
+	}
+	switch v := value.(type) {
+	case map[string]any:
+		if query, ok := v["referrerQuery"].(string); ok && strings.TrimSpace(query) != "" {
+			return strings.TrimSpace(query)
+		}
+		for _, item := range v {
+			if query := firstAppleReferrerQuery(item, depth+1); query != "" {
+				return query
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if query := firstAppleReferrerQuery(item, depth+1); query != "" {
+				return query
+			}
+		}
+	}
+	return ""
 }
 
 func extractAppleAppConfigJSON(data []byte) []byte {

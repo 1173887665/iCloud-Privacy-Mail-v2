@@ -1,0 +1,25 @@
+services:
+  ipm:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        IPM_VERSION: "${IPM_VERSION:-2.1.2}"
+        IPM_COMMIT: "${IPM_COMMIT:-unknown}"
+    image: "${IPM_IMAGE:-icloud-privacy-mail:2.1.2}"
+    container_name: "${IPM_CONTAINER_NAME:-icloud-privacy-mail}"
+    init: true
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+    ports:
+      - "127.0.0.1:${IPM_PORT:-8788}:8788"
+    volumes:
+      - ../data:/app/data
+      - ../config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8788/api/health | grep -q '\"status\":\"ok\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

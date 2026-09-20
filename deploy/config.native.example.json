@@ -1,0 +1,19 @@
+{
+  "host": "127.0.0.1",
+  "port": 8788,
+  "data_path": "/opt/iCloud-Privacy-Mail-v2/data/app.db",
+  "session_ttl_hours": 168,
+  "secure_cookie": true,
+  "api_key": "",
+  "public_base_url": "https://mail.example.com",
+  "icloud_default_host": "www.icloud.com.cn",
+  "apple_account_keep_alive_enabled": true,
+  "mail_watcher_enabled": true,
+  "database_backup_dir": "/opt/iCloud-Privacy-Mail-v2/data/backups",
+  "database_backup_retention_count": 3,
+  "database_message_retention_days": 90,
+  "database_change_log_limit": 5000,
+  "update_enabled": true,
+  "update_repository": "1173887665/iCloud-Privacy-Mail-v2",
+  "server_chan_hide_ip": true
+}

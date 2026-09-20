@@ -24,6 +24,11 @@ func TestCheckUsesRepositoryManifest(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		requestCount++
+		if request.URL.Path == "/repos/owner/repository/commits" {
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `[{"sha":"abcdef0123456789abcdef0123456789abcdef01","html_url":"https://github.com/owner/repository/commit/abcdef0123456789abcdef0123456789abcdef01"}]`)
+			return
+		}
 		if request.URL.Path != "/owner/repository/HEAD/internal/updatecheck/announcements.json" {
 			http.NotFound(writer, request)
 			return
@@ -47,12 +52,13 @@ func TestCheckUsesRepositoryManifest(t *testing.T) {
 
 	service := New(true, "owner/repository")
 	service.rawBaseURL = server.URL
+	service.apiBaseURL = server.URL
 	status := service.Check(context.Background(), true)
 	if status.Error != "" {
 		t.Fatalf("按仓库公告配置检查失败：%s", status.Error)
 	}
-	if requestCount != 1 {
-		t.Fatalf("更新检查应只请求一次公告配置，实际请求 %d 次", requestCount)
+	if requestCount != 2 {
+		t.Fatalf("更新检查应请求公告配置和最新提交，实际请求 %d 次", requestCount)
 	}
 	if !status.UpdateAvailable || status.Latest == nil || status.Latest.Version != "2.1.0" || status.Latest.Source != "config" {
 		t.Fatalf("最新版本判断不正确：%+v", status)
@@ -89,9 +95,42 @@ func TestCheckRejectsLegacyManifest(t *testing.T) {
 
 	service := New(true, "owner/repository")
 	service.rawBaseURL = server.URL
+	service.apiBaseURL = server.URL
 	status := service.Check(context.Background(), true)
 	if !strings.Contains(status.Error, "schema_version 应为 1") {
 		t.Fatalf("旧格式应返回明确配置错误：%q", status.Error)
+	}
+}
+
+func TestCheckDetectsCommitChangeWhenVersionMatches(t *testing.T) {
+	originalVersion := buildinfo.Version
+	originalCommit := buildinfo.Commit
+	buildinfo.Version = "2.1.0"
+	buildinfo.Commit = "1111111111111111111111111111111111111111"
+	defer func() {
+		buildinfo.Version = originalVersion
+		buildinfo.Commit = originalCommit
+	}()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(request.URL.Path, "/repos/") {
+			fmt.Fprint(writer, `[{"sha":"2222222222222222222222222222222222222222","html_url":"https://github.com/owner/repository/commit/2222222222222222222222222222222222222222"}]`)
+			return
+		}
+		fmt.Fprint(writer, `{"schema_version":1,"latest":{"version":"2.1.0","name":"2.1.0","notes":"源码有新的提交。"},"announcements":[]}`)
+	}))
+	defer server.Close()
+
+	service := New(true, "owner/repository")
+	service.rawBaseURL = server.URL
+	service.apiBaseURL = server.URL
+	status := service.Check(context.Background(), true)
+	if status.Error != "" || !status.UpdateAvailable {
+		t.Fatalf("版本相同但提交变化时应提示更新：%+v", status)
+	}
+	if status.Latest == nil || status.Latest.CommitSHA != "2222222222222222222222222222222222222222" {
+		t.Fatalf("未记录最新提交：%+v", status.Latest)
 	}
 }
 

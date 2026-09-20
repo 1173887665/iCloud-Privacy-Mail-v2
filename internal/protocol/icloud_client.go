@@ -1133,6 +1133,16 @@ func appleAccountAPIError(status int, data []byte, stage string) error {
 		msg = "空响应"
 	}
 	lower := strings.ToLower(msg)
+	if status == http.StatusPreconditionFailed {
+		if ineligibilityType, ok := appleAccountHMEIneligibilityType(data); ok {
+			switch ineligibilityType {
+			case "settings":
+				return errCode("apple_account_hme_settings", "当前 Apple 账号不满足创建新的隐藏邮箱条件，请在 Apple 账户设置中确认已开通 iCloud+、已启用“隐藏我的电子邮件”并完成相关条款后再试；"+detail, false)
+			default:
+				return errCode("apple_account_hme_ineligible", "当前 Apple 账号不满足创建新的隐藏邮箱条件，请检查 iCloud+ 与“隐藏我的电子邮件”设置后再试；"+detail, false)
+			}
+		}
+	}
 	if strings.Contains(lower, "limit") || strings.Contains(lower, "too many") || strings.Contains(lower, "rate") {
 		return errCode("apple_account_hme_limit", "Apple Account 已达到当前隐私邮箱创建上限，请稍后再试；"+detail, true)
 	}
@@ -1140,6 +1150,22 @@ func appleAccountAPIError(status int, data []byte, stage string) error {
 		return errCode("apple_account_auth_failed", "Apple Account 管理态已失效，请重新协议登录；"+detail, true)
 	}
 	return errCode("apple_account_api_failed", "Apple Account 接口失败；"+detail, true)
+}
+
+func appleAccountHMEIneligibilityType(data []byte) (string, bool) {
+	var payload struct {
+		Active            *bool  `json:"active"`
+		Exists            *bool  `json:"exists"`
+		IneligibilityType string `json:"ineligibilityType"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &payload); err != nil {
+		return "", false
+	}
+	if payload.Active == nil || payload.Exists == nil || *payload.Active || *payload.Exists {
+		return "", false
+	}
+	ineligibilityType := strings.ToLower(strings.TrimSpace(payload.IneligibilityType))
+	return ineligibilityType, ineligibilityType != ""
 }
 
 func appleAccountBodyLooksAuthExpired(lower string) bool {

@@ -73,7 +73,7 @@ func Default() Config {
 		DatabaseMessageRetentionDays:       90,
 		DatabaseChangeLogLimit:             5000,
 		UpdateEnabled:                      true,
-		UpdateRepository:                   "xiuxiu56/iCloud-Privacy-Mail-v2",
+		UpdateRepository:                   "1173887665/iCloud-Privacy-Mail-v2",
 		ServerChanHideIP:                   true,
 	}
 }

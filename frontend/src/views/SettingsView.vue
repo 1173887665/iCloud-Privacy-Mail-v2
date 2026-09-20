@@ -382,12 +382,13 @@ onBeforeUnmount(() => {
               <CircleAlert v-if="updateState.status.update_available" :size="19" class="mt-0.5 shrink-0 text-amber-500" />
               <CheckCircle2 v-else :size="19" class="mt-0.5 shrink-0 text-emerald-500" />
               <div class="min-w-0">
-                <strong class="block text-sm text-slate-800 dark:text-slate-100">{{ updateState.status.update_available ? '发现新的项目内容' : '当前已经是最新版本' }}</strong>
+                <strong class="block text-sm text-slate-800 dark:text-slate-100">{{ updateState.status.update_available ? (updateState.status.latest.commit_sha ? '发现新的 GitHub 提交' : '发现新的项目版本') : '当前已经是最新版本' }}</strong>
                 <p class="mt-1 truncate text-xs text-slate-500 dark:text-slate-300">{{ updateState.status.latest.name }}</p>
+                <p v-if="updateState.status.latest.commit_sha" class="mt-1 truncate font-mono text-[10px] text-slate-400">提交 {{ updateState.status.latest.commit_sha.slice(0, 12) }}</p>
                 <p v-if="updateState.status.latest.notes" class="mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-400">{{ updateState.status.latest.notes }}</p>
               </div>
             </div>
-            <a v-if="updateState.status.latest.url" class="secondary-button shrink-0" :href="updateState.status.latest.url" target="_blank" rel="noopener noreferrer"><ExternalLink :size="16" />重新下载源码</a>
+            <a v-if="updateState.status.latest.url || updateState.status.latest.commit_url" class="secondary-button shrink-0" :href="updateState.status.latest.commit_url || updateState.status.latest.url" target="_blank" rel="noopener noreferrer"><ExternalLink :size="16" />{{ updateState.status.latest.commit_url ? '查看 GitHub 提交' : '重新下载源码' }}</a>
           </div>
           <div v-else class="rounded-xl border border-slate-200 bg-slate-50 p-4 text-xs leading-5 text-slate-400 dark:border-slate-700 dark:bg-slate-900/40">{{ updateState.status?.enabled === false ? '配置文件已关闭更新检查。' : '点击“检查更新”读取仓库公告配置。' }}</div>
         </div>

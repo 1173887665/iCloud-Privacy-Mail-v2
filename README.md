@@ -75,6 +75,10 @@ go vet ./...
 npm --prefix frontend run build
 ```
 
+## 服务器部署
+
+需要与其他网站共存时，推荐使用独立子域名（例如 `mail.example.com`）并让 Nginx/Caddy 反向代理到本机 `127.0.0.1:8788`。Docker Compose、Nginx 和 systemd 模板位于 [`deploy/`](./deploy/)，详细步骤见 [`deploy/README.md`](./deploy/README.md)。
+
 ## 常用配置
 
 配置文件默认为 `config.json`，完整字段可参考 `config.example.json`。
@@ -100,7 +104,7 @@ data/app.db.key
 
 ## 版本与公告
 
-系统设置的更新检查只读取 [`internal/updatecheck/announcements.json`](./internal/updatecheck/announcements.json)。发布新版本时更新 `latest`；项目消息放入 `announcements`。该方式使用 GitHub Raw 公开文件，不请求 GitHub REST API。
+系统设置的更新检查读取 [`internal/updatecheck/announcements.json`](./internal/updatecheck/announcements.json)，并通过 GitHub REST API 比较默认分支最新提交 SHA。发布新版本时更新 `latest`；普通提交也会在当前版本号不变时显示更新提示。程序只提示，不会让运行中的进程覆盖自身；服务器确认更新后请按 [`deploy/README.md`](./deploy/README.md) 执行 `deploy/update-server.sh`。
 
 ```json
 {
@@ -110,7 +114,7 @@ data/app.db.key
     "name": "2.1.2 源码版",
     "notes": "新增 iCloud Web API 分场景开关，请重新下载最新源代码并按文档重新构建",
     "published_at": "2026-08-29T22:30:00+08:00",
-    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    "url": "https://github.com/1173887665/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": []
 }

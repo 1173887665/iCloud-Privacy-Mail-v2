@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,6 +15,22 @@ func TestAppleAccountEmptyUnauthorizedResponseIsAuthFailure(t *testing.T) {
 	}
 	if message == "" {
 		t.Fatal("空响应 401 缺少错误说明")
+	}
+}
+
+func TestAppleAccountSettingsIneligibilityIsNotRetryable(t *testing.T) {
+	payload := []byte(`{"active":false,"exists":false,"ineligibilityReason":"unknown","ineligibilityType":"settings","newToPrivateEmail":"true","useOslOStyle":false}`)
+	err := appleAccountAPIError(http.StatusPreconditionFailed, payload, "生成候选隐私邮箱")
+	code, message, retryable := ErrorDetails(err)
+	t.Logf("code=%s retryable=%t message=%s", code, retryable, message)
+	if code != "apple_account_hme_settings" {
+		t.Fatalf("HTTP 412 settings 应归类为账户设置错误，实际 code=%q", code)
+	}
+	if retryable {
+		t.Fatal("账户资格设置错误不应标记为可重试")
+	}
+	if !strings.Contains(message, "隐藏我的电子邮件") {
+		t.Fatalf("账户设置错误缺少可执行提示：%s", message)
 	}
 }
 
